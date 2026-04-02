@@ -23,6 +23,12 @@ static void findGPUIndexFromFd(NVDriver *drv) {
     uint8_t drmUuid[16];
     get_device_uuid(&drv->driverContext, drmUuid);
 
+    /* If CUDA is not available (32-bit encode-only mode), default to GPU 0 */
+    if (!drv->cudaAvailable) {
+        drv->cudaGpuId = 0;
+        return;
+    }
+
     int gpuCount = 0;
     if (CHECK_CUDA_RESULT(drv->cu->cuDeviceGetCount(&gpuCount))) {
         return;
@@ -193,9 +199,23 @@ static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surfa
                     p[i].channelCount, 8 * fmtInfo->bppc, p[i].fourcc, &driverImages[i]);
     }
 
-    for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-        if (!import_to_cuda(drv, &driverImages[i], 8 * fmtInfo->bppc, p[i].channelCount, &backingImage->cudaImages[i], &backingImage->arrays[i]))
-            goto bail;
+    /* Import into CUDA only when CUDA is available.
+     * In IPC encode-only mode, surfaces are allocated via DRM but not imported
+     * into CUDA — the 64-bit helper handles CUDA import from the DMA-BUF fd. */
+    if (drv->cudaAvailable) {
+        for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+            if (!import_to_cuda(drv, &driverImages[i], 8 * fmtInfo->bppc, p[i].channelCount, &backingImage->cudaImages[i], &backingImage->arrays[i]))
+                goto bail;
+        }
+    } else {
+        /* Without CUDA, just close the nvFd2 handles that import_to_cuda would
+         * normally close, and keep the DRM fds for export. */
+        for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+            if (driverImages[i].nvFd2 != 0) {
+                close(driverImages[i].nvFd2);
+                driverImages[i].nvFd2 = 0;
+            }
+        }
     }
 
     backingImage->width = surface->width;

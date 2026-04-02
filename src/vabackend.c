@@ -1239,7 +1239,7 @@ static VAStatus nvDestroySurfaces(
             surface->importedDmaBufFd = -1;
         }
 
-        if (drv->cudaAvailable) {
+        if (drv->backend != NULL) {
             drv->backend->detachBackingImageFromSurface(drv, surface);
         }
 
@@ -2058,31 +2058,55 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
         LOG("IPC encode: encoder initialized %ux%u", params.width, params.height);
     }
 
-    /* Encode via IPC — prefer DMA-BUF zero-copy if surface has an imported fd,
-     * otherwise fall back to host pixel data from vaPutImage. */
+    /* Encode via IPC.
+     * Priority: 1) DRM-backed surface (realiseSurface → DMA-BUF fd)
+     *           2) Imported DMA-BUF from vaCreateSurfaces attribs
+     *           3) Host pixel data from vaPutImage */
     void *bitstream = NULL;
     uint32_t bsSize = 0;
     int ret;
+    int dmabuf_fd = -1;
+    NVEncIPCEncodeDmaBufParams dp = {0};
+    bool useDmaBuf = false;
 
-    if (surface->importedDmaBufFd >= 0) {
-        /* GPU zero-copy path: send DMA-BUF fd to 64-bit helper */
-        NVEncIPCEncodeDmaBufParams dp = {
-            .width = nvencCtx->width,
-            .height = nvencCtx->height,
-            .num_planes = surface->importedNumPlanes,
-            .data_size = surface->importedDataSize,
-            .is10bit = (nvencCtx->inputFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? 1 : 0,
-        };
+    /* Try to realise the surface via DRM backend for GPU-backed memory */
+    if (drv->backend != NULL && surface->backingImage == NULL) {
+        drv->backend->realiseSurface(drv, surface);
+    }
+
+    if (surface->backingImage != NULL && surface->backingImage->fds[0] > 0) {
+        /* DRM-backed surface: use backing image's DMA-BUF fd */
+        BackingImage *img = surface->backingImage;
+        dmabuf_fd = img->fds[0]; /* Luma plane fd */
+        dp.width = nvencCtx->width;
+        dp.height = nvencCtx->height;
+        dp.pitches[0] = img->strides[0];
+        dp.offsets[0] = 0;
+        dp.num_planes = 1; /* NVENC takes the full NV12 from one buffer */
+        dp.data_size = img->size[0];
+        dp.is10bit = (nvencCtx->inputFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? 1 : 0;
+        useDmaBuf = true;
+    } else if (surface->importedDmaBufFd >= 0) {
+        /* Imported DMA-BUF from vaCreateSurfaces attribs */
+        dmabuf_fd = surface->importedDmaBufFd;
+        dp.width = nvencCtx->width;
+        dp.height = nvencCtx->height;
+        dp.num_planes = surface->importedNumPlanes;
+        dp.data_size = surface->importedDataSize;
+        dp.is10bit = (nvencCtx->inputFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? 1 : 0;
         for (uint32_t p = 0; p < surface->importedNumPlanes && p < 4; p++) {
             dp.pitches[p] = surface->importedPitches[p];
             dp.offsets[p] = surface->importedOffsets[p];
         }
+        useDmaBuf = true;
+    }
+
+    if (useDmaBuf) {
         if (nvencCtx->frameCount < 3) {
-            LOG("IPC encode: DMABUF path fd=%d %ux%u planes=%u size=%u pitch=%u",
-                surface->importedDmaBufFd, dp.width, dp.height,
-                dp.num_planes, dp.data_size, dp.pitches[0]);
+            LOG("IPC encode: DMABUF fd=%d %ux%u pitch=%u size=%u",
+                dmabuf_fd, dp.width, dp.height, dp.pitches[0], dp.data_size);
         }
-        ret = nvenc_ipc_encode_dmabuf(nvencCtx->ipcFd, surface->importedDmaBufFd,
+        ret = nvenc_ipc_encode_dmabuf(nvencCtx->ipcFd, dmabuf_fd,
                                        &dp, &bitstream, &bsSize);
     } else if (surface->hostPixelData != NULL && surface->hostPixelSize > 0) {
         /* Host memory path: from vaPutImage */
@@ -3016,9 +3040,11 @@ static VAStatus nvExportSurfaceHandle(
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
 
-    //LOG("Exporting surface: %d (%p)", surface->pictureIdx, surface);
+    LOG("Exporting surface: %d (%p)", surface->pictureIdx, surface);
 
-    CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
+    if (drv->cudaAvailable) {
+        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
+    }
 
     if (!drv->backend->realiseSurface(drv, surface)) {
         LOG("Unable to export surface");
@@ -3034,7 +3060,9 @@ static VAStatus nvExportSurfaceHandle(
     //                                                             ptr->layers[1].offset[0], ptr->layers[1].pitch[0],
     //                                                             ptr->objects[1].drm_format_modifier);
 
-    CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+    if (drv->cudaAvailable) {
+        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+    }
 
     return VA_STATUS_SUCCESS;
 }
@@ -3054,6 +3082,11 @@ static VAStatus nvTerminate( VADriverContextP ctx )
         CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
     } else {
         deleteAllObjects(drv);
+        /* Release the DRM backend if it was initialized for IPC mode */
+        if (drv->backend != NULL) {
+            drv->backend->destroyAllBackingImage(drv);
+            drv->backend->releaseExporter(drv);
+        }
     }
 
     pthread_mutex_lock(&concurrency_mutex);
@@ -3238,9 +3271,18 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         nvQueryConfigProfiles2(ctx, drv->profiles, &drv->profileCount);
     } else {
         /* Encode-only IPC path: no CUDA context, no decode profiles.
-         * Manually add the profiles that NVENC supports for encoding. */
-        LOG("CUDA unavailable — encode-only mode");
+         * Init the direct backend for GPU surface allocation via DRM.
+         * This lets Steam render into our surfaces via OpenGL/EGL,
+         * and we send the DMA-BUF fds to the 64-bit helper for encoding. */
+        LOG("CUDA unavailable — encode-only mode, init DRM backend for surfaces");
         drv->cudaContext = NULL;
+
+        if (backend == DIRECT && drv->backend->initExporter(drv)) {
+            LOG("DRM backend initialized for surface allocation");
+        } else {
+            LOG("DRM backend init failed — surfaces will have no GPU backing");
+        }
+
         int p = 0;
         drv->profiles[p++] = VAProfileH264ConstrainedBaseline;
         drv->profiles[p++] = VAProfileH264Main;
