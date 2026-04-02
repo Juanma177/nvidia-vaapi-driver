@@ -70,6 +70,9 @@ typedef struct
     pthread_mutex_t         mutex;
     pthread_cond_t          cond;
     bool                    decodeFailed;
+    /* Host-memory pixel buffer for encode-only IPC path (no CUDA) */
+    void                   *hostPixelData;
+    uint32_t                hostPixelSize;
 } NVSurface;
 
 typedef enum
@@ -157,6 +160,7 @@ typedef struct _NVDriver
     int                     profileCount;
     VAProfile               profiles[MAX_PROFILES];
     bool                    nvencAvailable;
+    bool                    cudaAvailable;  /* false when 32-bit CUDA fails */
 } NVDriver;
 
 struct _NVCodec;
