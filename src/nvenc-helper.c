@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <poll.h>
+#include <sys/time.h>
 
 #include <ffnvcodec/dynlink_loader.h>
 #include <ffnvcodec/nvEncodeAPI.h>
@@ -581,6 +582,12 @@ int main(int argc, char **argv)
             HELPER_LOG("accept: %s", strerror(errno));
             continue; /* Don't exit on accept error — keep listening */
         }
+
+        /* Set recv timeout so we detect dead clients instead of blocking forever.
+         * A streaming encode at 60fps sends a frame every ~16ms.
+         * 5 seconds of silence means the client is gone. */
+        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         /* Handle one client at a time (sufficient for Steam's single encode stream) */
         handle_client(client_fd);
