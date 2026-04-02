@@ -1121,7 +1121,9 @@ static VAStatus nvCreateSurfaces2(
             break;
     }
 
-    CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
+    if (drv->cudaAvailable) {
+        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
+    }
 
     for (uint32_t i = 0; i < num_surfaces; i++) {
         Object surfaceObject = allocateObject(drv, OBJECT_TYPE_SURFACE, sizeof(NVSurface));
@@ -1134,13 +1136,17 @@ static VAStatus nvCreateSurfaces2(
         suf->bitDepth = bitdepth;
         suf->context = NULL;
         suf->chromaFormat = chromaFormat;
+        suf->hostPixelData = NULL;
+        suf->hostPixelSize = 0;
         pthread_mutex_init(&suf->mutex, NULL);
         pthread_cond_init(&suf->cond, NULL);
 
         LOG("Creating surface %ux%u, format %X (%p)", width, height, format, suf);
     }
 
-    CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+    if (drv->cudaAvailable) {
+        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+    }
 
     return VA_STATUS_SUCCESS;
 }
