@@ -322,7 +322,11 @@ static bool encoder_encode(HelperEncoder *enc, const void *frame_data,
     picParams.outputBitstream = enc->outputBuffer;
     picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     picParams.pictureType = NV_ENC_PIC_TYPE_UNKNOWN;
-    picParams.encodePicFlags = (enc->frameCount == 0 || force_idr)
+    /* Force IDR: on first frame, on explicit request, or every 60 frames
+     * for streaming recovery. Without periodic IDR, a single lost packet
+     * causes the client to freeze until the next intra_period (up to 60s). */
+    bool needIDR = (enc->frameCount == 0) || force_idr || (enc->frameCount % 60 == 0);
+    picParams.encodePicFlags = needIDR
         ? (NV_ENC_PIC_FLAG_OUTPUT_SPSPPS | NV_ENC_PIC_FLAG_FORCEIDR)
         : 0;
     picParams.frameIdx = (uint32_t)enc->frameCount;
