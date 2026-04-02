@@ -2107,16 +2107,26 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
     }
 
     if (useHostData) {
-        /* Host memory path: pixel data from vaDeriveImage/vaPutImage */
+        /* Host memory path: pixel data from vaDeriveImage/vaPutImage.
+         * Snapshot the buffer before sending — Steam may write the next
+         * frame into the same hostPixelData while we're sending this one. */
+        uint32_t frameSize = surface->hostPixelSize;
+        void *snapshot = malloc(frameSize);
+        if (snapshot == NULL) {
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        memcpy(snapshot, surface->hostPixelData, frameSize);
+
         if (nvencCtx->frameCount < 3) {
             LOG("IPC encode: HOST path %ux%u %u bytes",
-                nvencCtx->width, nvencCtx->height, surface->hostPixelSize);
+                nvencCtx->width, nvencCtx->height, frameSize);
         }
-        ret = nvenc_ipc_encode(nvencCtx->ipcFd, surface->hostPixelData,
+        ret = nvenc_ipc_encode(nvencCtx->ipcFd, snapshot,
                                 nvencCtx->width, nvencCtx->height,
-                                surface->hostPixelSize,
+                                frameSize,
                                 nvencCtx->forceIDR ? 1 : 0,
                                 &bitstream, &bsSize);
+        free(snapshot);
         nvencCtx->forceIDR = false;
     } else if (useDmaBuf) {
         if (nvencCtx->frameCount < 3) {
