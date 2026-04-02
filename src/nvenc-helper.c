@@ -489,7 +489,8 @@ int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
 
-    log_enabled = (getenv("NVD_LOG") != NULL);
+    /* Always log to stderr — this is a daemon, logs are essential for diagnostics */
+    log_enabled = 1;
 
     signal(SIGTERM, sighandler);
     signal(SIGINT, sighandler);
@@ -557,17 +558,14 @@ int main(int argc, char **argv)
 
     HELPER_LOG("Listening on %s", sock_path);
 
-    /* Accept loop with idle timeout */
+    /* Accept loop — runs until SIGTERM/SIGINT */
     while (running) {
         struct pollfd pfd = { .fd = listen_fd, .events = POLLIN };
-        int ret = poll(&pfd, 1, 30000); /* 30s idle timeout */
+        int ret = poll(&pfd, 1, -1); /* Block forever until connection or signal */
 
         if (ret < 0) {
             if (errno == EINTR) continue;
-            break;
-        }
-        if (ret == 0) {
-            HELPER_LOG("Idle timeout, exiting");
+            HELPER_LOG("poll: %s", strerror(errno));
             break;
         }
 
@@ -575,11 +573,12 @@ int main(int argc, char **argv)
         if (client_fd < 0) {
             if (errno == EINTR) continue;
             HELPER_LOG("accept: %s", strerror(errno));
-            break;
+            continue; /* Don't exit on accept error — keep listening */
         }
 
         /* Handle one client at a time (sufficient for Steam's single encode stream) */
         handle_client(client_fd);
+        HELPER_LOG("Ready for next client");
     }
 
     close(listen_fd);

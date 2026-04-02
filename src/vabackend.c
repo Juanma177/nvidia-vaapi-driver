@@ -1944,13 +1944,25 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
 
     /* Connect to helper on first use */
     if (nvencCtx->ipcFd < 0) {
-        nvencCtx->ipcFd = nvenc_ipc_connect_or_start("/usr/lib/x86_64-linux-gnu/nvenc-helper");
+        /* Try connecting to an already-running helper first, then start one */
+        static const char *helper_paths[] = {
+            "/usr/libexec/nvenc-helper",
+            "/usr/local/libexec/nvenc-helper",
+            "/usr/lib/nvidia-vaapi-driver/nvenc-helper",
+            NULL
+        };
+        nvencCtx->ipcFd = nvenc_ipc_connect();
         if (nvencCtx->ipcFd < 0) {
-            /* Try libexecdir path */
-            nvencCtx->ipcFd = nvenc_ipc_connect_or_start("/usr/libexec/nvenc-helper");
+            for (int pi = 0; helper_paths[pi] != NULL; pi++) {
+                if (access(helper_paths[pi], X_OK) == 0) {
+                    LOG("IPC encode: starting helper: %s", helper_paths[pi]);
+                    nvencCtx->ipcFd = nvenc_ipc_connect_or_start(helper_paths[pi]);
+                    if (nvencCtx->ipcFd >= 0) break;
+                }
+            }
         }
         if (nvencCtx->ipcFd < 0) {
-            LOG("IPC encode: failed to connect to nvenc-helper");
+            LOG("IPC encode: failed to connect to nvenc-helper (is it installed?)");
             return VA_STATUS_ERROR_OPERATION_FAILED;
         }
         LOG("IPC encode: connected to nvenc-helper (fd=%d)", nvencCtx->ipcFd);
