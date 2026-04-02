@@ -258,6 +258,7 @@ fail:
 }
 
 static bool encoder_encode(HelperEncoder *enc, const void *frame_data,
+                           uint32_t frame_width, uint32_t frame_height,
                            uint32_t frame_size, bool force_idr,
                            void **out_data, uint32_t *out_size)
 {
@@ -274,22 +275,29 @@ static bool encoder_encode(HelperEncoder *enc, const void *frame_data,
         return false;
     }
 
-    /* Copy NV12/P010 data into NVENC's buffer, respecting pitch */
+    /* Copy NV12/P010 data into NVENC's buffer, respecting pitch.
+     * frame_height may be smaller than enc->height (e.g. 1080 vs 1088)
+     * because the encoder uses MB-aligned height. Zero-fill padding rows. */
     uint32_t bpp = enc->is10bit ? 2 : 1;
-    uint32_t srcPitch = enc->width * bpp;
+    uint32_t srcPitch = frame_width * bpp;
     uint32_t dstPitch = lockIn.pitch;
     uint8_t *src = (uint8_t *)frame_data;
     uint8_t *dst = (uint8_t *)lockIn.bufferDataPtr;
 
-    /* Copy luma */
-    for (uint32_t y = 0; y < enc->height; y++) {
+    /* Zero the entire buffer to handle padding cleanly */
+    memset(dst, 0, dstPitch * enc->height * 3 / 2);
+
+    /* Copy luma — only frame_height lines from the source */
+    for (uint32_t y = 0; y < frame_height; y++) {
         memcpy(dst + y * dstPitch, src + y * srcPitch, srcPitch);
     }
 
-    /* Copy chroma (NV12: interleaved UV, half height) */
-    uint32_t chromaOffset_src = srcPitch * enc->height;
+    /* Copy chroma (NV12: interleaved UV, half height).
+     * Source chroma starts at srcPitch * frame_height.
+     * Dest chroma starts at dstPitch * enc->height (encoder's full height). */
+    uint32_t chromaOffset_src = srcPitch * frame_height;
     uint32_t chromaOffset_dst = dstPitch * enc->height;
-    uint32_t chromaHeight = enc->height / 2;
+    uint32_t chromaHeight = frame_height / 2;
 
     for (uint32_t y = 0; y < chromaHeight; y++) {
         memcpy(dst + chromaOffset_dst + y * dstPitch,
@@ -450,7 +458,7 @@ static void handle_client(int client_fd)
 
             void *bitstream = NULL;
             uint32_t bsSize = 0;
-            bool ok = encoder_encode(&enc, frame, ep.frame_size, ep.force_idr, &bitstream, &bsSize);
+            bool ok = encoder_encode(&enc, frame, ep.width, ep.height, ep.frame_size, ep.force_idr, &bitstream, &bsSize);
             free(frame);
 
             cu->cuCtxPopCurrent(NULL);

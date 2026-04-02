@@ -1660,6 +1660,12 @@ static VAStatus nvBeginPicture(
     if (nvCtx->isEncode) {
         nvCtx->renderTarget = surface;
         surface->context = nvCtx;
+        Object surfObj = getObject(drv, OBJECT_TYPE_SURFACE, render_target);
+        if (nvCtx->encodeData && ((NVENCContext*)nvCtx->encodeData)->frameCount < 5) {
+            LOG("BeginPicture encode: surface_id=%d (%p) hasHostData=%d hostSize=%u",
+                render_target, surface,
+                surface->hostPixelData != NULL, surface->hostPixelSize);
+        }
         return VA_STATUS_SUCCESS;
     }
 
@@ -2108,8 +2114,12 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
 
     if (useHostData) {
         /* Host memory path: pixel data from vaDeriveImage/vaPutImage.
-         * Snapshot the buffer before sending — Steam may write the next
-         * frame into the same hostPixelData while we're sending this one. */
+         * IMPORTANT: use the SURFACE dimensions (e.g. 1920x1080), not the
+         * encoder dimensions (e.g. 1920x1088). The surface has exactly
+         * width*height*1.5 bytes of NV12 data. The encoder may be configured
+         * for a larger MB-aligned height — the helper pads the extra lines. */
+        uint32_t surfW = surface->width;
+        uint32_t surfH = surface->height;
         uint32_t frameSize = surface->hostPixelSize;
         void *snapshot = malloc(frameSize);
         if (snapshot == NULL) {
@@ -2118,12 +2128,11 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
         memcpy(snapshot, surface->hostPixelData, frameSize);
 
         if (nvencCtx->frameCount < 3) {
-            LOG("IPC encode: HOST path %ux%u %u bytes",
-                nvencCtx->width, nvencCtx->height, frameSize);
+            LOG("IPC encode: HOST path surface=%ux%u encoder=%ux%u %u bytes",
+                surfW, surfH, nvencCtx->width, nvencCtx->height, frameSize);
         }
         ret = nvenc_ipc_encode(nvencCtx->ipcFd, snapshot,
-                                nvencCtx->width, nvencCtx->height,
-                                frameSize,
+                                surfW, surfH, frameSize,
                                 nvencCtx->forceIDR ? 1 : 0,
                                 &bitstream, &bsSize);
         free(snapshot);
