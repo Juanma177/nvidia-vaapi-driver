@@ -258,7 +258,7 @@ fail:
 }
 
 static bool encoder_encode(HelperEncoder *enc, const void *frame_data,
-                           uint32_t frame_size,
+                           uint32_t frame_size, bool force_idr,
                            void **out_data, uint32_t *out_size)
 {
     NVENCSTATUS st;
@@ -314,7 +314,7 @@ static bool encoder_encode(HelperEncoder *enc, const void *frame_data,
     picParams.outputBitstream = enc->outputBuffer;
     picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     picParams.pictureType = NV_ENC_PIC_TYPE_UNKNOWN;
-    picParams.encodePicFlags = (enc->frameCount == 0)
+    picParams.encodePicFlags = (enc->frameCount == 0 || force_idr)
         ? (NV_ENC_PIC_FLAG_OUTPUT_SPSPPS | NV_ENC_PIC_FLAG_FORCEIDR)
         : 0;
     picParams.frameIdx = (uint32_t)enc->frameCount;
@@ -450,7 +450,7 @@ static void handle_client(int client_fd)
 
             void *bitstream = NULL;
             uint32_t bsSize = 0;
-            bool ok = encoder_encode(&enc, frame, ep.frame_size, &bitstream, &bsSize);
+            bool ok = encoder_encode(&enc, frame, ep.frame_size, ep.force_idr, &bitstream, &bsSize);
             free(frame);
 
             cu->cuCtxPopCurrent(NULL);

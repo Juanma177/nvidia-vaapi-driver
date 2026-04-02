@@ -57,6 +57,7 @@ typedef struct {
     uint32_t width;
     uint32_t height;
     uint32_t frame_size;    /* total bytes of pixel data */
+    uint32_t force_idr;     /* 1 = force IDR keyframe */
 } NVEncIPCEncodeParams;
 
 /* CMD_ENCODE_DMABUF payload.
@@ -92,6 +93,7 @@ int nvenc_ipc_init(int fd, const NVEncIPCInitParams *params);
  * Returns 0 on success. */
 int nvenc_ipc_encode(int fd, const void *frame_data,
                      uint32_t width, uint32_t height, uint32_t frame_size,
+                     uint32_t force_idr,
                      void **bitstream_out, uint32_t *bitstream_size_out);
 
 /* Send DMA-BUF fd and receive encoded bitstream (GPU zero-copy path).

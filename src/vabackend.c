@@ -1934,9 +1934,10 @@ static VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx)
 
     /* Encode the frame.
      * Use only OUTPUT_SPSPPS on the first frame; after that let NVENC handle it. */
-    uint32_t picFlags = (nvencCtx->frameCount == 0)
+    uint32_t picFlags = (nvencCtx->frameCount == 0 || nvencCtx->forceIDR)
         ? (NV_ENC_PIC_FLAG_OUTPUT_SPSPPS | NV_ENC_PIC_FLAG_FORCEIDR)
         : 0;
+    nvencCtx->forceIDR = false;
     int encResult = nvenc_encode_frame(nvencCtx, mappedResource, mappedFmt,
                                        encWidth, encHeight, pitch,
                                        NV_ENC_PIC_TYPE_UNKNOWN, picFlags);
@@ -2114,7 +2115,9 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
         ret = nvenc_ipc_encode(nvencCtx->ipcFd, surface->hostPixelData,
                                 nvencCtx->width, nvencCtx->height,
                                 surface->hostPixelSize,
+                                nvencCtx->forceIDR ? 1 : 0,
                                 &bitstream, &bsSize);
+        nvencCtx->forceIDR = false;
     } else if (useDmaBuf) {
         if (nvencCtx->frameCount < 3) {
             LOG("IPC encode: DMABUF planes=%d fds=[%d,%d] %ux%u pitch=%u sizes=[%u,%u]",

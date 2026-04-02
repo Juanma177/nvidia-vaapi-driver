@@ -56,8 +56,11 @@ void h264enc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     LOG("H264 encode: picture params, coded_buf=%d, pic_fields=0x%x",
         pic->coded_buf, pic->pic_fields.value);
 
-    /* Track the coded buffer so EndPicture knows where to put the output */
     nvencCtx->currentCodedBufId = pic->coded_buf;
+    nvencCtx->forceIDR = (pic->pic_fields.bits.idr_pic_flag != 0);
+    if (nvencCtx->forceIDR) {
+        LOG("H264 encode: IDR requested, coded_buf=%d", pic->coded_buf);
+    }
 }
 
 void h264enc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)

@@ -150,12 +150,14 @@ int nvenc_ipc_init(int fd, const NVEncIPCInitParams *params)
 
 int nvenc_ipc_encode(int fd, const void *frame_data,
                      uint32_t width, uint32_t height, uint32_t frame_size,
+                     uint32_t force_idr,
                      void **bitstream_out, uint32_t *bitstream_size_out)
 {
     NVEncIPCEncodeParams enc_params = {
         .width = width,
         .height = height,
-        .frame_size = frame_size
+        .frame_size = frame_size,
+        .force_idr = force_idr,
     };
 
     NVEncIPCMsgHeader hdr = {

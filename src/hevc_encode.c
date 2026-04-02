@@ -50,8 +50,11 @@ void hevcenc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     VAEncPictureParameterBufferHEVC *pic =
         (VAEncPictureParameterBufferHEVC*) buffer->ptr;
 
-    LOG("HEVC encode: picture params, coded_buf=%d", pic->coded_buf);
     nvencCtx->currentCodedBufId = pic->coded_buf;
+    nvencCtx->forceIDR = (pic->pic_fields.bits.idr_pic_flag != 0);
+    if (nvencCtx->forceIDR) {
+        LOG("HEVC encode: picture params, coded_buf=%d, IDR requested", pic->coded_buf);
+    }
 }
 
 void hevcenc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)

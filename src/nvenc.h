@@ -59,6 +59,8 @@ typedef struct {
     NVENCOutputBuffer               outputBuffer;
     /* Current coded buffer ID from VAEncPictureParameterBuffer */
     VABufferID                      currentCodedBufId;
+    /* Force IDR on next frame (set by picture params idr_pic_flag) */
+    bool                            forceIDR;
     /* IPC mode: encode via 64-bit helper when CUDA is unavailable */
     bool                            useIPC;
     int                             ipcFd;   /* socket to nvenc-helper, -1 if not connected */
