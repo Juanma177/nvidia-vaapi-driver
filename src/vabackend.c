@@ -1191,8 +1191,16 @@ static VAStatus nvCreateSurfaces2(
             }
         }
 
-        LOG("Creating surface %ux%u, format %X (%p) dmabuf=%d",
-            width, height, format, suf, suf->importedDmaBufFd);
+        /* In IPC encode-only mode, eagerly allocate the backing image now
+         * so the surface has GPU memory that can be exported via DMA-BUF.
+         * Steam's OpenGL capture needs to render into these surfaces BEFORE
+         * the encode begins. Without early allocation, the surface is empty. */
+        if (!drv->cudaAvailable && drv->backend != NULL) {
+            drv->backend->realiseSurface(drv, suf);
+        }
+
+        LOG("Creating surface %ux%u, format %X (%p) dmabuf=%d backing=%p",
+            width, height, format, suf, suf->importedDmaBufFd, suf->backingImage);
     }
 
     if (drv->cudaAvailable) {
