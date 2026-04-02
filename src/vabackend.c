@@ -2398,8 +2398,75 @@ static VAStatus nvDeriveImage(
         VAImage *image     /* out */
     )
 {
-    //LOG("In %s", __func__);
-    //FAILED because we don't support it
+    NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    NVSurface *surfaceObj = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, surface);
+
+    if (surfaceObj == NULL) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    /* In IPC encode-only mode, derive a host-memory image so Steam's ffmpeg
+     * can write captured NV12 frames into it via vaMapBuffer. The encoder
+     * then reads from this host memory via the IPC pixel-data path. */
+    if (!drv->cudaAvailable) {
+        uint32_t width = surfaceObj->width;
+        uint32_t height = surfaceObj->height;
+        int bpp = (surfaceObj->bitDepth > 8) ? 2 : 1;
+        uint32_t lumaSize = width * bpp * height;
+        uint32_t chromaSize = width * bpp * (height / 2);
+        uint32_t totalSize = lumaSize + chromaSize;
+
+        /* Allocate or reuse the surface's host pixel buffer */
+        if (surfaceObj->hostPixelData == NULL || surfaceObj->hostPixelSize < totalSize) {
+            free(surfaceObj->hostPixelData);
+            surfaceObj->hostPixelData = malloc(totalSize);
+            if (surfaceObj->hostPixelData == NULL) {
+                surfaceObj->hostPixelSize = 0;
+                return VA_STATUS_ERROR_ALLOCATION_FAILED;
+            }
+            surfaceObj->hostPixelSize = totalSize;
+            memset(surfaceObj->hostPixelData, 0, totalSize);
+        }
+
+        /* Create a buffer object for the image data (points to the surface's host memory) */
+        Object imageBufferObj = allocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
+        NVBuffer *imageBuf = (NVBuffer*) imageBufferObj->obj;
+        imageBuf->bufferType = VAImageBufferType;
+        imageBuf->size = totalSize;
+        imageBuf->elements = 1;
+        imageBuf->ptr = surfaceObj->hostPixelData; /* Shared with surface! */
+        imageBuf->offset = (size_t)-1; /* Sentinel: don't free ptr on destroy */
+
+        /* Create the image object */
+        Object imageObj = allocateObject(drv, OBJECT_TYPE_IMAGE, sizeof(NVImage));
+        NVImage *img = (NVImage*) imageObj->obj;
+        img->width = width;
+        img->height = height;
+        img->format = (bpp == 1) ? NV_FORMAT_NV12 : NV_FORMAT_P010;
+        img->imageBuffer = imageBuf;
+
+        /* Fill VAImage output */
+        memset(image, 0, sizeof(*image));
+        image->image_id = imageObj->id;
+        image->format.fourcc = (bpp == 1) ? VA_FOURCC_NV12 : VA_FOURCC_P010;
+        image->format.byte_order = VA_LSB_FIRST;
+        image->format.bits_per_pixel = (bpp == 1) ? 12 : 24;
+        image->buf = imageBufferObj->id;
+        image->width = width;
+        image->height = height;
+        image->data_size = totalSize;
+        image->num_planes = 2;
+        image->pitches[0] = width * bpp;
+        image->pitches[1] = width * bpp;
+        image->offsets[0] = 0;
+        image->offsets[1] = lumaSize;
+
+        LOG("DeriveImage: surface %d → host image %d (%ux%u, %u bytes)",
+            surface, imageObj->id, width, height, totalSize);
+        return VA_STATUS_SUCCESS;
+    }
+
+    /* Normal CUDA path: not supported */
     return VA_STATUS_ERROR_OPERATION_FAILED;
 }
 
@@ -2418,7 +2485,10 @@ static VAStatus nvDestroyImage(
     Object imageBufferObj = getObjectByPtr(drv, OBJECT_TYPE_BUFFER, img->imageBuffer);
 
     if (imageBufferObj != NULL) {
-        if (img->imageBuffer->ptr != NULL) {
+        /* For derived images, the buffer ptr is shared with the surface's
+         * hostPixelData — don't free it (the surface owns the memory).
+         * For regular images (from vaCreateImage), we own the buffer. */
+        if (img->imageBuffer->ptr != NULL && img->imageBuffer->offset != (size_t)-1) {
             free(img->imageBuffer->ptr);
         }
 
