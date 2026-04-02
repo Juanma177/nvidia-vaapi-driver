@@ -466,7 +466,6 @@ static void handle_client(int client_fd)
 
         case NVENC_IPC_CMD_ENCODE_DMABUF: {
             if (!enc.initialized) {
-                /* Drain payload */
                 if (hdr.payload_size > 0) {
                     void *tmp = malloc(hdr.payload_size);
                     if (tmp) { recv_all(client_fd, tmp, hdr.payload_size); free(tmp); }
@@ -475,13 +474,14 @@ static void handle_client(int client_fd)
                 break;
             }
 
-            /* Receive params WITH DMA-BUF fd via SCM_RIGHTS */
+            /* Receive params WITH per-plane DMA-BUF fds via SCM_RIGHTS */
             NVEncIPCEncodeDmaBufParams dp;
-            int dmabuf_fd = -1;
+            int dmabuf_fds[4] = {-1, -1, -1, -1};
+            int num_fds = 0;
             {
                 struct iovec iov = { .iov_base = &dp, .iov_len = sizeof(dp) };
                 union {
-                    char buf[CMSG_SPACE(sizeof(int))];
+                    char buf[CMSG_SPACE(sizeof(int) * 4)];
                     struct cmsghdr align;
                 } cmsg_buf;
                 memset(&cmsg_buf, 0, sizeof(cmsg_buf));
@@ -495,7 +495,7 @@ static void handle_client(int client_fd)
 
                 ssize_t n = recvmsg(client_fd, &msg, 0);
                 if (n != sizeof(dp)) {
-                    HELPER_LOG("DMABUF: recvmsg failed: %zd", n);
+                    HELPER_LOG("DMABUF: recvmsg failed: %zd (errno=%d)", n, errno);
                     send_response(client_fd, -1, NULL, 0);
                     break;
                 }
@@ -503,95 +503,161 @@ static void handle_client(int client_fd)
                 struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
                 if (cmsg && cmsg->cmsg_level == SOL_SOCKET &&
                     cmsg->cmsg_type == SCM_RIGHTS) {
-                    memcpy(&dmabuf_fd, CMSG_DATA(cmsg), sizeof(int));
+                    num_fds = (int)((cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+                    if (num_fds > 4) num_fds = 4;
+                    memcpy(dmabuf_fds, CMSG_DATA(cmsg), (size_t)num_fds * sizeof(int));
                 }
             }
 
-            if (dmabuf_fd < 0) {
-                HELPER_LOG("DMABUF: no fd received");
+            if (num_fds < 1 || dmabuf_fds[0] < 0) {
+                HELPER_LOG("DMABUF: no fds received");
                 send_response(client_fd, -1, NULL, 0);
                 break;
             }
-
-            HELPER_LOG("DMABUF: fd=%d %ux%u planes=%u size=%u",
-                       dmabuf_fd, dp.width, dp.height, dp.num_planes, dp.data_size);
 
             cu->cuCtxPushCurrent(enc.cudaCtx);
 
-            /* Import DMA-BUF into CUDA as external memory */
-            CUDA_EXTERNAL_MEMORY_HANDLE_DESC extMemDesc = {
-                .type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
-                .handle.fd = dmabuf_fd,
-                .size = dp.data_size,
-                .flags = 0,
-            };
+            if (enc.frameCount < 3) {
+                HELPER_LOG("DMABUF: fds=[%d,%d] %ux%u planes=%u bppc=%u sizes=[%u,%u]",
+                           dmabuf_fds[0], dmabuf_fds[1],
+                           dp.width, dp.height, dp.num_planes, dp.bppc,
+                           dp.sizes[0], dp.sizes[1]);
+            }
 
-            CUexternalMemory extMem = NULL;
-            CUresult cres = cu->cuImportExternalMemory(&extMem, &extMemDesc);
-            /* After import, CUDA owns the fd — don't close it */
-            if (cres != CUDA_SUCCESS) {
-                HELPER_LOG("DMABUF: cuImportExternalMemory failed: %d", cres);
-                close(dmabuf_fd);
+            /* Import each plane's DMA-BUF into CUDA as a CUarray,
+             * same as the driver's import_to_cuda in direct-export-buf.c */
+            CUexternalMemory extMems[4] = {0};
+            CUmipmappedArray mipmaps[4] = {0};
+            CUarray arrays[4] = {0};
+            bool importOk = true;
+
+            for (int i = 0; i < (int)dp.num_planes && i < num_fds; i++) {
+                CUDA_EXTERNAL_MEMORY_HANDLE_DESC extMemDesc = {
+                    .type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
+                    .handle.fd = dmabuf_fds[i],
+                    .size = dp.sizes[i],
+                    .flags = 0,
+                };
+
+                CUresult cres = cu->cuImportExternalMemory(&extMems[i], &extMemDesc);
+                /* CUDA takes ownership of the fd on success */
+                if (cres != CUDA_SUCCESS) {
+                    HELPER_LOG("DMABUF: cuImportExternalMemory plane %d failed: %d", i, cres);
+                    close(dmabuf_fds[i]);
+                    importOk = false;
+                    break;
+                }
+
+                /* Determine plane format */
+                int bpc = 8 * dp.bppc;
+                int channels = (i == 0) ? 1 : 2; /* Y=1ch, UV=2ch interleaved */
+                uint32_t planeW = (i == 0) ? dp.width : dp.width / 2;
+                uint32_t planeH = (i == 0) ? dp.height : dp.height / 2;
+
+                CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC mipmapDesc = {
+                    .arrayDesc = {
+                        .Width = planeW,
+                        .Height = planeH,
+                        .Depth = 0,
+                        .Format = (bpc == 8) ? CU_AD_FORMAT_UNSIGNED_INT8 : CU_AD_FORMAT_UNSIGNED_INT16,
+                        .NumChannels = (unsigned int)channels,
+                        .Flags = 0,
+                    },
+                    .numLevels = 1,
+                    .offset = 0,
+                };
+
+                cres = cu->cuExternalMemoryGetMappedMipmappedArray(&mipmaps[i], extMems[i], &mipmapDesc);
+                if (cres != CUDA_SUCCESS) {
+                    HELPER_LOG("DMABUF: cuExternalMemoryGetMappedMipmappedArray plane %d failed: %d", i, cres);
+                    importOk = false;
+                    break;
+                }
+
+                cres = cu->cuMipmappedArrayGetLevel(&arrays[i], mipmaps[i], 0);
+                if (cres != CUDA_SUCCESS) {
+                    HELPER_LOG("DMABUF: cuMipmappedArrayGetLevel plane %d failed: %d", i, cres);
+                    importOk = false;
+                    break;
+                }
+            }
+
+            if (!importOk) {
+                for (int i = 0; i < 4; i++) {
+                    if (mipmaps[i]) cu->cuMipmappedArrayDestroy(mipmaps[i]);
+                    if (extMems[i]) cu->cuDestroyExternalMemory(extMems[i]);
+                    else if (dmabuf_fds[i] >= 0) close(dmabuf_fds[i]);
+                }
                 cu->cuCtxPopCurrent(NULL);
                 send_response(client_fd, -1, NULL, 0);
                 break;
             }
 
-            /* Map the external memory to get a device pointer */
-            CUDA_EXTERNAL_MEMORY_BUFFER_DESC bufDesc = {
-                .offset = 0,
-                .size = dp.data_size,
-                .flags = 0,
-            };
-            CUdeviceptr devPtr = 0;
-            cres = cu->cuExternalMemoryGetMappedBuffer(&devPtr, extMem, &bufDesc);
-            if (cres != CUDA_SUCCESS) {
-                HELPER_LOG("DMABUF: cuExternalMemoryGetMappedBuffer failed: %d", cres);
-                cu->cuDestroyExternalMemory(extMem);
-                cu->cuCtxPopCurrent(NULL);
-                send_response(client_fd, -1, NULL, 0);
-                break;
+            /* Copy CUarrays to linear buffer (same as nvEndPictureEncode direct path) */
+            uint32_t bpp = dp.is10bit ? 2 : 1;
+            uint32_t pitch = dp.width * bpp;
+            pitch = (pitch + 255) & ~255; /* Align to 256 */
+            uint32_t lumaSize = pitch * dp.height;
+            uint32_t chromaSize = pitch * (dp.height / 2);
+            uint32_t totalSize = lumaSize + chromaSize;
+
+            CUdeviceptr linearBuf = 0;
+            cu->cuMemAlloc(&linearBuf, totalSize);
+            cu->cuMemsetD8Async(linearBuf, 0, totalSize, 0);
+
+            /* Copy luma */
+            CUDA_MEMCPY2D cpy = {0};
+            cpy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+            cpy.srcArray = arrays[0];
+            cpy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+            cpy.dstDevice = linearBuf;
+            cpy.dstPitch = pitch;
+            cpy.WidthInBytes = dp.width * bpp;
+            cpy.Height = dp.height;
+            cu->cuMemcpy2D(&cpy);
+
+            /* Copy chroma */
+            if (dp.num_planes >= 2 && arrays[1]) {
+                memset(&cpy, 0, sizeof(cpy));
+                cpy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+                cpy.srcArray = arrays[1];
+                cpy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+                cpy.dstDevice = linearBuf + lumaSize;
+                cpy.dstPitch = pitch;
+                cpy.WidthInBytes = dp.width * bpp;
+                cpy.Height = dp.height / 2;
+                cu->cuMemcpy2D(&cpy);
             }
 
-            /* Register the CUDA buffer with NVENC */
+            /* Register linear buffer with NVENC */
             NV_ENC_BUFFER_FORMAT bufFmt = dp.is10bit
-                ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT
-                : NV_ENC_BUFFER_FORMAT_NV12;
+                ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT : NV_ENC_BUFFER_FORMAT_NV12;
 
             NV_ENC_REGISTER_RESOURCE regRes = {0};
             regRes.version = NV_ENC_REGISTER_RESOURCE_VER;
             regRes.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
-            regRes.resourceToRegister = (void *)devPtr;
+            regRes.resourceToRegister = (void *)linearBuf;
             regRes.width = dp.width;
             regRes.height = dp.height;
-            regRes.pitch = dp.pitches[0];
+            regRes.pitch = pitch;
             regRes.bufferFormat = bufFmt;
             regRes.bufferUsage = NV_ENC_INPUT_IMAGE;
 
             NVENCSTATUS nvst = enc.funcs.nvEncRegisterResource(enc.encoder, &regRes);
             if (nvst != NV_ENC_SUCCESS) {
                 HELPER_LOG("DMABUF: nvEncRegisterResource failed: %d", nvst);
-                cu->cuMemFree(devPtr);
-                cu->cuDestroyExternalMemory(extMem);
-                cu->cuCtxPopCurrent(NULL);
-                send_response(client_fd, -1, NULL, 0);
-                break;
+                cu->cuMemFree(linearBuf);
+                goto dmabuf_cleanup;
             }
 
-            /* Map for encode */
             NV_ENC_MAP_INPUT_RESOURCE mapRes = {0};
             mapRes.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
             mapRes.registeredResource = regRes.registeredResource;
-
             nvst = enc.funcs.nvEncMapInputResource(enc.encoder, &mapRes);
             if (nvst != NV_ENC_SUCCESS) {
-                HELPER_LOG("DMABUF: nvEncMapInputResource failed: %d", nvst);
                 enc.funcs.nvEncUnregisterResource(enc.encoder, regRes.registeredResource);
-                cu->cuMemFree(devPtr);
-                cu->cuDestroyExternalMemory(extMem);
-                cu->cuCtxPopCurrent(NULL);
-                send_response(client_fd, -1, NULL, 0);
-                break;
+                cu->cuMemFree(linearBuf);
+                goto dmabuf_cleanup;
             }
 
             /* Encode */
@@ -601,7 +667,7 @@ static void handle_client(int client_fd)
             picParams.bufferFmt = mapRes.mappedBufferFmt;
             picParams.inputWidth = dp.width;
             picParams.inputHeight = dp.height;
-            picParams.inputPitch = dp.pitches[0];
+            picParams.inputPitch = pitch;
             picParams.outputBitstream = enc.outputBuffer;
             picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
             picParams.pictureType = NV_ENC_PIC_TYPE_UNKNOWN;
@@ -612,17 +678,13 @@ static void handle_client(int client_fd)
 
             nvst = enc.funcs.nvEncEncodePicture(enc.encoder, &picParams);
 
-            /* Unmap + unregister + free CUDA resources regardless */
             enc.funcs.nvEncUnmapInputResource(enc.encoder, mapRes.mappedResource);
             enc.funcs.nvEncUnregisterResource(enc.encoder, regRes.registeredResource);
-            cu->cuMemFree(devPtr);
-            cu->cuDestroyExternalMemory(extMem);
+            cu->cuMemFree(linearBuf);
 
             if (nvst != NV_ENC_SUCCESS) {
                 HELPER_LOG("DMABUF: nvEncEncodePicture failed: %d", nvst);
-                cu->cuCtxPopCurrent(NULL);
-                send_response(client_fd, -1, NULL, 0);
-                break;
+                goto dmabuf_cleanup;
             }
 
             enc.frameCount++;
@@ -631,22 +693,25 @@ static void handle_client(int client_fd)
             }
 
             /* Lock and send bitstream */
-            NV_ENC_LOCK_BITSTREAM lockOut = {0};
-            lockOut.version = NV_ENC_LOCK_BITSTREAM_VER;
-            lockOut.outputBitstream = enc.outputBuffer;
-
-            nvst = enc.funcs.nvEncLockBitstream(enc.encoder, &lockOut);
-            if (nvst != NV_ENC_SUCCESS) {
-                HELPER_LOG("DMABUF: nvEncLockBitstream failed: %d", nvst);
-                cu->cuCtxPopCurrent(NULL);
-                send_response(client_fd, -1, NULL, 0);
-                break;
+            {
+                NV_ENC_LOCK_BITSTREAM lockOut = {0};
+                lockOut.version = NV_ENC_LOCK_BITSTREAM_VER;
+                lockOut.outputBitstream = enc.outputBuffer;
+                nvst = enc.funcs.nvEncLockBitstream(enc.encoder, &lockOut);
+                if (nvst == NV_ENC_SUCCESS) {
+                    send_response(client_fd, 0, lockOut.bitstreamBufferPtr,
+                                  lockOut.bitstreamSizeInBytes);
+                    enc.funcs.nvEncUnlockBitstream(enc.encoder, enc.outputBuffer);
+                } else {
+                    send_response(client_fd, -1, NULL, 0);
+                }
             }
 
-            send_response(client_fd, 0, lockOut.bitstreamBufferPtr,
-                          lockOut.bitstreamSizeInBytes);
-            enc.funcs.nvEncUnlockBitstream(enc.encoder, enc.outputBuffer);
-
+dmabuf_cleanup:
+            for (int i = 0; i < 4; i++) {
+                if (mipmaps[i]) cu->cuMipmappedArrayDestroy(mipmaps[i]);
+                if (extMems[i]) cu->cuDestroyExternalMemory(extMems[i]);
+            }
             cu->cuCtxPopCurrent(NULL);
             break;
         }

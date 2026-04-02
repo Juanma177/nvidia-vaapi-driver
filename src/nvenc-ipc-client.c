@@ -193,33 +193,35 @@ int nvenc_ipc_encode(int fd, const void *frame_data,
     return 0;
 }
 
-/* Send a DMA-BUF fd via SCM_RIGHTS ancillary data */
-static bool send_fd(int sock, int dmabuf_fd, const void *data, size_t len)
+/* Send multiple DMA-BUF fds via SCM_RIGHTS ancillary data */
+static bool send_fds(int sock, const int *fds, int num_fds, const void *data, size_t len)
 {
     struct iovec iov = { .iov_base = (void *)data, .iov_len = len };
     union {
-        char buf[CMSG_SPACE(sizeof(int))];
+        char buf[CMSG_SPACE(sizeof(int) * 4)]; /* up to 4 fds */
         struct cmsghdr align;
     } cmsg_buf;
+    memset(&cmsg_buf, 0, sizeof(cmsg_buf));
 
+    size_t fd_size = sizeof(int) * (size_t)num_fds;
     struct msghdr msg = {
         .msg_iov = &iov,
         .msg_iovlen = 1,
         .msg_control = cmsg_buf.buf,
-        .msg_controllen = sizeof(cmsg_buf.buf),
+        .msg_controllen = CMSG_SPACE(fd_size),
     };
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     cmsg->cmsg_level = SOL_SOCKET;
     cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(cmsg), &dmabuf_fd, sizeof(int));
+    cmsg->cmsg_len = CMSG_LEN(fd_size);
+    memcpy(CMSG_DATA(cmsg), fds, fd_size);
 
     ssize_t n = sendmsg(sock, &msg, MSG_NOSIGNAL);
     return n == (ssize_t)len;
 }
 
-int nvenc_ipc_encode_dmabuf(int fd, int dmabuf_fd,
+int nvenc_ipc_encode_dmabuf(int fd, const int *dmabuf_fds, int num_fds,
                             const NVEncIPCEncodeDmaBufParams *params,
                             void **bitstream_out, uint32_t *bitstream_size_out)
 {
@@ -231,8 +233,8 @@ int nvenc_ipc_encode_dmabuf(int fd, int dmabuf_fd,
     /* Send the header normally */
     if (!send_all(fd, &hdr, sizeof(hdr))) return -1;
 
-    /* Send the params WITH the fd attached via SCM_RIGHTS */
-    if (!send_fd(fd, dmabuf_fd, params, sizeof(*params))) return -1;
+    /* Send the params WITH the fds attached via SCM_RIGHTS */
+    if (!send_fds(fd, dmabuf_fds, num_fds, params, sizeof(*params))) return -1;
 
     /* Receive response */
     NVEncIPCRespHeader resp;

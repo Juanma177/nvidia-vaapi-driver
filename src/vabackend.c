@@ -2065,7 +2065,8 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
     void *bitstream = NULL;
     uint32_t bsSize = 0;
     int ret;
-    int dmabuf_fd = -1;
+    int dmabuf_fds[4] = {-1, -1, -1, -1};
+    int num_dmabuf_fds = 0;
     NVEncIPCEncodeDmaBufParams dp = {0};
     bool useDmaBuf = false;
 
@@ -2075,38 +2076,32 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
     }
 
     if (surface->backingImage != NULL && surface->backingImage->fds[0] > 0) {
-        /* DRM-backed surface: use backing image's DMA-BUF fd */
+        /* DRM-backed surface: send per-plane DMA-BUF fds to helper.
+         * The helper imports each into a CUarray, copies to linear, encodes. */
         BackingImage *img = surface->backingImage;
-        dmabuf_fd = img->fds[0]; /* Luma plane fd */
-        dp.width = nvencCtx->width;
-        dp.height = nvencCtx->height;
-        dp.pitches[0] = img->strides[0];
-        dp.offsets[0] = 0;
-        dp.num_planes = 1; /* NVENC takes the full NV12 from one buffer */
-        dp.data_size = img->size[0];
+        const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
+        dp.width = surface->width;
+        dp.height = surface->height;
+        dp.num_planes = fmtInfo->numPlanes;
+        dp.bppc = fmtInfo->bppc;
         dp.is10bit = (nvencCtx->inputFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? 1 : 0;
-        useDmaBuf = true;
-    } else if (surface->importedDmaBufFd >= 0) {
-        /* Imported DMA-BUF from vaCreateSurfaces attribs */
-        dmabuf_fd = surface->importedDmaBufFd;
-        dp.width = nvencCtx->width;
-        dp.height = nvencCtx->height;
-        dp.num_planes = surface->importedNumPlanes;
-        dp.data_size = surface->importedDataSize;
-        dp.is10bit = (nvencCtx->inputFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? 1 : 0;
-        for (uint32_t p = 0; p < surface->importedNumPlanes && p < 4; p++) {
-            dp.pitches[p] = surface->importedPitches[p];
-            dp.offsets[p] = surface->importedOffsets[p];
+        for (uint32_t p = 0; p < fmtInfo->numPlanes && p < 4; p++) {
+            dmabuf_fds[p] = img->fds[p];
+            dp.pitches[p] = img->strides[p];
+            dp.offsets[p] = 0;
+            dp.sizes[p] = img->size[p];
         }
+        num_dmabuf_fds = (int)fmtInfo->numPlanes;
         useDmaBuf = true;
     }
 
     if (useDmaBuf) {
         if (nvencCtx->frameCount < 3) {
-            LOG("IPC encode: DMABUF fd=%d %ux%u pitch=%u size=%u",
-                dmabuf_fd, dp.width, dp.height, dp.pitches[0], dp.data_size);
+            LOG("IPC encode: DMABUF planes=%d fds=[%d,%d] %ux%u pitch=%u sizes=[%u,%u]",
+                num_dmabuf_fds, dmabuf_fds[0], dmabuf_fds[1],
+                dp.width, dp.height, dp.pitches[0], dp.sizes[0], dp.sizes[1]);
         }
-        ret = nvenc_ipc_encode_dmabuf(nvencCtx->ipcFd, dmabuf_fd,
+        ret = nvenc_ipc_encode_dmabuf(nvencCtx->ipcFd, dmabuf_fds, num_dmabuf_fds,
                                        &dp, &bitstream, &bsSize);
     } else if (surface->hostPixelData != NULL && surface->hostPixelSize > 0) {
         /* Host memory path: from vaPutImage */

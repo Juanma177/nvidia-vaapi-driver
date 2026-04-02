@@ -59,14 +59,17 @@ typedef struct {
     uint32_t frame_size;    /* total bytes of pixel data */
 } NVEncIPCEncodeParams;
 
-/* CMD_ENCODE_DMABUF payload (DMA-BUF fd sent via SCM_RIGHTS ancillary data) */
+/* CMD_ENCODE_DMABUF payload.
+ * Multiple DMA-BUF fds (one per plane) sent via SCM_RIGHTS ancillary data.
+ * For NV12: 2 fds (Y plane, UV plane). */
 typedef struct {
     uint32_t width;
     uint32_t height;
     uint32_t pitches[4];     /* stride per plane */
     uint32_t offsets[4];     /* offset per plane */
+    uint32_t sizes[4];       /* memory size per plane */
     uint32_t num_planes;
-    uint32_t data_size;      /* total buffer size */
+    uint32_t bppc;           /* bytes per pixel per channel */
     uint32_t is10bit;
 } NVEncIPCEncodeDmaBufParams;
 
@@ -95,7 +98,7 @@ int nvenc_ipc_encode(int fd, const void *frame_data,
  * The fd is sent via SCM_RIGHTS ancillary data.
  * bitstream_out is malloc'd by this function, caller must free.
  * Returns 0 on success. */
-int nvenc_ipc_encode_dmabuf(int fd, int dmabuf_fd,
+int nvenc_ipc_encode_dmabuf(int fd, const int *dmabuf_fds, int num_fds,
                             const NVEncIPCEncodeDmaBufParams *params,
                             void **bitstream_out, uint32_t *bitstream_size_out);
 
