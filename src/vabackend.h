@@ -2,6 +2,7 @@
 #define VABACKEND_H
 
 #include <ffnvcodec/dynlink_loader.h>
+#include <ffnvcodec/nvEncodeAPI.h>
 #include <va/va_backend.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -129,6 +130,7 @@ typedef struct _NVDriver
 {
     CudaFunctions           *cu;
     CuvidFunctions          *cv;
+    NvencFunctions          *nv;
     CUcontext               cudaContext;
     CUvideoctxlock          vidLock;
     Array/*<Object>*/       objects;
@@ -154,6 +156,7 @@ typedef struct _NVDriver
     int                     numFramesPresented;
     int                     profileCount;
     VAProfile               profiles[MAX_PROFILES];
+    bool                    nvencAvailable;
 } NVDriver;
 
 struct _NVCodec;
@@ -185,6 +188,8 @@ typedef struct _NVContext
     pthread_mutex_t     surfaceCreationMutex;
     int                 surfaceCount;
     bool                firstKeyframeValid;
+    bool                isEncode;
+    void               *encodeData; /* NVENCContext* for encode contexts */
 } NVContext;
 
 typedef struct
@@ -195,6 +200,7 @@ typedef struct
     cudaVideoChromaFormat   chromaFormat;
     int                     bitDepth;
     cudaVideoCodec          cudaCodec;
+    bool                    isEncode;
 } NVConfig;
 
 typedef void (*HandlerFunc)(NVContext*, NVBuffer* , CUVIDPICPARAMS*);
