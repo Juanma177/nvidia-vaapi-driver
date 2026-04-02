@@ -22,8 +22,9 @@
 
 /* Commands */
 #define NVENC_IPC_CMD_INIT    1  /* Initialize encoder */
-#define NVENC_IPC_CMD_ENCODE  2  /* Encode a frame */
+#define NVENC_IPC_CMD_ENCODE  2  /* Encode a frame (host pixel data) */
 #define NVENC_IPC_CMD_CLOSE   3  /* Close encoder and disconnect */
+#define NVENC_IPC_CMD_ENCODE_DMABUF 4  /* Encode from DMA-BUF fd (GPU zero-copy) */
 
 /* Message header (client → helper) */
 typedef struct {
@@ -58,6 +59,17 @@ typedef struct {
     uint32_t frame_size;    /* total bytes of pixel data */
 } NVEncIPCEncodeParams;
 
+/* CMD_ENCODE_DMABUF payload (DMA-BUF fd sent via SCM_RIGHTS ancillary data) */
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitches[4];     /* stride per plane */
+    uint32_t offsets[4];     /* offset per plane */
+    uint32_t num_planes;
+    uint32_t data_size;      /* total buffer size */
+    uint32_t is10bit;
+} NVEncIPCEncodeDmaBufParams;
+
 /* IPC client functions (used by the 32-bit driver) */
 
 /* Get the socket path for this user */
@@ -78,6 +90,14 @@ int nvenc_ipc_init(int fd, const NVEncIPCInitParams *params);
 int nvenc_ipc_encode(int fd, const void *frame_data,
                      uint32_t width, uint32_t height, uint32_t frame_size,
                      void **bitstream_out, uint32_t *bitstream_size_out);
+
+/* Send DMA-BUF fd and receive encoded bitstream (GPU zero-copy path).
+ * The fd is sent via SCM_RIGHTS ancillary data.
+ * bitstream_out is malloc'd by this function, caller must free.
+ * Returns 0 on success. */
+int nvenc_ipc_encode_dmabuf(int fd, int dmabuf_fd,
+                            const NVEncIPCEncodeDmaBufParams *params,
+                            void **bitstream_out, uint32_t *bitstream_size_out);
 
 /* Send close command and close the socket. */
 void nvenc_ipc_close(int fd);

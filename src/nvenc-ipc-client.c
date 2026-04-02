@@ -193,6 +193,74 @@ int nvenc_ipc_encode(int fd, const void *frame_data,
     return 0;
 }
 
+/* Send a DMA-BUF fd via SCM_RIGHTS ancillary data */
+static bool send_fd(int sock, int dmabuf_fd, const void *data, size_t len)
+{
+    struct iovec iov = { .iov_base = (void *)data, .iov_len = len };
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } cmsg_buf;
+
+    struct msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = cmsg_buf.buf,
+        .msg_controllen = sizeof(cmsg_buf.buf),
+    };
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &dmabuf_fd, sizeof(int));
+
+    ssize_t n = sendmsg(sock, &msg, MSG_NOSIGNAL);
+    return n == (ssize_t)len;
+}
+
+int nvenc_ipc_encode_dmabuf(int fd, int dmabuf_fd,
+                            const NVEncIPCEncodeDmaBufParams *params,
+                            void **bitstream_out, uint32_t *bitstream_size_out)
+{
+    NVEncIPCMsgHeader hdr = {
+        .cmd = NVENC_IPC_CMD_ENCODE_DMABUF,
+        .payload_size = sizeof(*params)
+    };
+
+    /* Send the header normally */
+    if (!send_all(fd, &hdr, sizeof(hdr))) return -1;
+
+    /* Send the params WITH the fd attached via SCM_RIGHTS */
+    if (!send_fd(fd, dmabuf_fd, params, sizeof(*params))) return -1;
+
+    /* Receive response */
+    NVEncIPCRespHeader resp;
+    if (!recv_all(fd, &resp, sizeof(resp))) return -1;
+
+    if (resp.status != 0) {
+        *bitstream_out = NULL;
+        *bitstream_size_out = 0;
+        return resp.status;
+    }
+
+    if (resp.payload_size > 0) {
+        void *data = malloc(resp.payload_size);
+        if (data == NULL) return -1;
+        if (!recv_all(fd, data, resp.payload_size)) {
+            free(data);
+            return -1;
+        }
+        *bitstream_out = data;
+        *bitstream_size_out = resp.payload_size;
+    } else {
+        *bitstream_out = NULL;
+        *bitstream_size_out = 0;
+    }
+
+    return 0;
+}
+
 void nvenc_ipc_close(int fd)
 {
     NVEncIPCMsgHeader hdr = {

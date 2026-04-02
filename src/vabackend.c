@@ -1065,6 +1065,35 @@ static VAStatus nvCreateSurfaces2(
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
 
+    /* Log surface attributes for diagnostics */
+    uint32_t memType = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
+    VASurfaceAttribExternalBuffers *extBuf = NULL;
+    for (unsigned int a = 0; a < num_attribs; a++) {
+        LOG("Surface attrib[%u]: type=%d, flags=0x%x, value_type=%d",
+            a, attrib_list[a].type, attrib_list[a].flags,
+            attrib_list[a].value.type);
+        if (attrib_list[a].type == VASurfaceAttribMemoryType &&
+            attrib_list[a].value.type == VAGenericValueTypeInteger) {
+            memType = attrib_list[a].value.value.i;
+            LOG("  MemoryType: 0x%x", memType);
+        }
+        if (attrib_list[a].type == VASurfaceAttribExternalBufferDescriptor &&
+            attrib_list[a].value.type == VAGenericValueTypePointer) {
+            extBuf = (VASurfaceAttribExternalBuffers*)attrib_list[a].value.value.p;
+            if (extBuf) {
+                LOG("  ExternalBuffers: %ux%u fmt=0x%x planes=%u bufs=%u size=%u",
+                    extBuf->width, extBuf->height, extBuf->pixel_format,
+                    extBuf->num_planes, extBuf->num_buffers, extBuf->data_size);
+                for (unsigned int b = 0; b < extBuf->num_buffers && b < 4; b++) {
+                    LOG("    buffer[%u] = %lu (fd or ptr)", b, (unsigned long)extBuf->buffers[b]);
+                }
+                for (unsigned int p = 0; p < extBuf->num_planes && p < 4; p++) {
+                    LOG("    plane[%u]: pitch=%u offset=%u", p, extBuf->pitches[p], extBuf->offsets[p]);
+                }
+            }
+        }
+    }
+
     cudaVideoSurfaceFormat nvFormat;
     cudaVideoChromaFormat chromaFormat;
     int bitdepth;
@@ -1138,10 +1167,32 @@ static VAStatus nvCreateSurfaces2(
         suf->chromaFormat = chromaFormat;
         suf->hostPixelData = NULL;
         suf->hostPixelSize = 0;
+        suf->importedDmaBufFd = -1;
+        suf->importedNumPlanes = 0;
+        suf->importedDataSize = 0;
         pthread_mutex_init(&suf->mutex, NULL);
         pthread_cond_init(&suf->cond, NULL);
 
-        LOG("Creating surface %ux%u, format %X (%p)", width, height, format, suf);
+        /* Store imported DMA-BUF if provided via external buffer attribs */
+        if (extBuf != NULL && extBuf->num_buffers > 0) {
+            /* DRM_PRIME: buffers[] contains DMA-BUF fds.
+             * dup() the fd so the surface owns its own copy. */
+            if (memType & (VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2)) {
+                int srcFd = (int)extBuf->buffers[i < extBuf->num_buffers ? i : 0];
+                suf->importedDmaBufFd = dup(srcFd);
+                suf->importedNumPlanes = extBuf->num_planes;
+                suf->importedDataSize = extBuf->data_size;
+                for (uint32_t p = 0; p < extBuf->num_planes && p < 4; p++) {
+                    suf->importedPitches[p] = extBuf->pitches[p];
+                    suf->importedOffsets[p] = extBuf->offsets[p];
+                }
+                LOG("  Surface %u: imported DMA-BUF fd=%d (dup of %d), size=%u",
+                    i, suf->importedDmaBufFd, srcFd, suf->importedDataSize);
+            }
+        }
+
+        LOG("Creating surface %ux%u, format %X (%p) dmabuf=%d",
+            width, height, format, suf, suf->importedDmaBufFd);
     }
 
     if (drv->cudaAvailable) {
@@ -1182,6 +1233,11 @@ static VAStatus nvDestroySurfaces(
 
         free(surface->hostPixelData);
         surface->hostPixelData = NULL;
+
+        if (surface->importedDmaBufFd >= 0) {
+            close(surface->importedDmaBufFd);
+            surface->importedDmaBufFd = -1;
+        }
 
         if (drv->cudaAvailable) {
             drv->backend->detachBackingImageFromSurface(drv, surface);
@@ -2002,21 +2058,45 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
         LOG("IPC encode: encoder initialized %ux%u", params.width, params.height);
     }
 
-    /* The surface's host pixel data should have been filled by vaPutImage */
-    if (surface->hostPixelData == NULL || surface->hostPixelSize == 0) {
-        LOG("IPC encode: surface has no pixel data");
-        return VA_STATUS_ERROR_OPERATION_FAILED;
-    }
-
-    /* Encode via IPC */
+    /* Encode via IPC — prefer DMA-BUF zero-copy if surface has an imported fd,
+     * otherwise fall back to host pixel data from vaPutImage. */
     void *bitstream = NULL;
     uint32_t bsSize = 0;
-    int ret = nvenc_ipc_encode(nvencCtx->ipcFd, surface->hostPixelData,
+    int ret;
+
+    if (surface->importedDmaBufFd >= 0) {
+        /* GPU zero-copy path: send DMA-BUF fd to 64-bit helper */
+        NVEncIPCEncodeDmaBufParams dp = {
+            .width = nvencCtx->width,
+            .height = nvencCtx->height,
+            .num_planes = surface->importedNumPlanes,
+            .data_size = surface->importedDataSize,
+            .is10bit = (nvencCtx->inputFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? 1 : 0,
+        };
+        for (uint32_t p = 0; p < surface->importedNumPlanes && p < 4; p++) {
+            dp.pitches[p] = surface->importedPitches[p];
+            dp.offsets[p] = surface->importedOffsets[p];
+        }
+        if (nvencCtx->frameCount < 3) {
+            LOG("IPC encode: DMABUF path fd=%d %ux%u planes=%u size=%u pitch=%u",
+                surface->importedDmaBufFd, dp.width, dp.height,
+                dp.num_planes, dp.data_size, dp.pitches[0]);
+        }
+        ret = nvenc_ipc_encode_dmabuf(nvencCtx->ipcFd, surface->importedDmaBufFd,
+                                       &dp, &bitstream, &bsSize);
+    } else if (surface->hostPixelData != NULL && surface->hostPixelSize > 0) {
+        /* Host memory path: from vaPutImage */
+        ret = nvenc_ipc_encode(nvencCtx->ipcFd, surface->hostPixelData,
                                 nvencCtx->width, nvencCtx->height,
                                 surface->hostPixelSize,
                                 &bitstream, &bsSize);
+    } else {
+        LOG("IPC encode: surface has no pixel data (no DMA-BUF, no host data)");
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
     if (ret != 0) {
-        LOG("IPC encode: encode failed");
+        LOG("IPC encode: encode failed (ret=%d)", ret);
         return VA_STATUS_ERROR_ENCODING_ERROR;
     }
 
@@ -2038,6 +2118,13 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
         memcpy(coded->bitstreamData, bitstream, bsSize);
         coded->bitstreamSize = bsSize;
         coded->hasData = true;
+        if (nvencCtx->frameCount < 5 || nvencCtx->frameCount % 300 == 0) {
+            unsigned char *bs = (unsigned char *)coded->bitstreamData;
+            LOG("IPC encode: frame %lu, %u bytes, first4=[%02x %02x %02x %02x]",
+                (unsigned long)nvencCtx->frameCount, bsSize,
+                bsSize > 0 ? bs[0] : 0, bsSize > 1 ? bs[1] : 0,
+                bsSize > 2 ? bs[2] : 0, bsSize > 3 ? bs[3] : 0);
+        }
     }
 
     free(bitstream);
