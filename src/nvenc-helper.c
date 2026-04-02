@@ -313,7 +313,9 @@ static bool encoder_encode(HelperEncoder *enc, const void *frame_data,
     picParams.outputBitstream = enc->outputBuffer;
     picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     picParams.pictureType = NV_ENC_PIC_TYPE_UNKNOWN;
-    picParams.encodePicFlags = (enc->frameCount == 0) ? NV_ENC_PIC_FLAG_OUTPUT_SPSPPS : 0;
+    picParams.encodePicFlags = (enc->frameCount == 0)
+        ? (NV_ENC_PIC_FLAG_OUTPUT_SPSPPS | NV_ENC_PIC_FLAG_FORCEIDR)
+        : 0;
     picParams.frameIdx = (uint32_t)enc->frameCount;
     picParams.inputTimeStamp = enc->frameCount;
 
@@ -324,6 +326,10 @@ static bool encoder_encode(HelperEncoder *enc, const void *frame_data,
     }
 
     enc->frameCount++;
+
+    if (enc->frameCount % 300 == 0) {
+        HELPER_LOG("Encoded %lu frames", (unsigned long)enc->frameCount);
+    }
 
     /* Lock output bitstream */
     NV_ENC_LOCK_BITSTREAM lockOut = {0};

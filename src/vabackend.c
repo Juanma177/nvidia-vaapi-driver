@@ -1870,7 +1870,9 @@ static VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx)
 
     /* Encode the frame.
      * Use only OUTPUT_SPSPPS on the first frame; after that let NVENC handle it. */
-    uint32_t picFlags = (nvencCtx->frameCount == 0) ? NV_ENC_PIC_FLAG_OUTPUT_SPSPPS : 0;
+    uint32_t picFlags = (nvencCtx->frameCount == 0)
+        ? (NV_ENC_PIC_FLAG_OUTPUT_SPSPPS | NV_ENC_PIC_FLAG_FORCEIDR)
+        : 0;
     int encResult = nvenc_encode_frame(nvencCtx, mappedResource, mappedFmt,
                                        encWidth, encHeight, pitch,
                                        NV_ENC_PIC_TYPE_UNKNOWN, picFlags);
