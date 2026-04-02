@@ -208,9 +208,12 @@ static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surfa
                 goto bail;
         }
     } else {
-        /* Without CUDA, just close the nvFd2 handles that import_to_cuda would
-         * normally close, and keep the DRM fds for export. */
+        /* Without CUDA, keep the nvFd handles for the IPC helper to import.
+         * Close nvFd2 which import_to_cuda would normally close. */
         for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+            backingImage->nvFds[i] = driverImages[i].nvFd;
+            backingImage->memorySizes[i] = driverImages[i].memorySize;
+            driverImages[i].nvFd = 0; /* Ownership transferred to backingImage */
             if (driverImages[i].nvFd2 != 0) {
                 close(driverImages[i].nvFd2);
                 driverImages[i].nvFd2 = 0;

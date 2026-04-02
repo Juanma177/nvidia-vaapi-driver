@@ -2075,9 +2075,11 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
         drv->backend->realiseSurface(drv, surface);
     }
 
-    if (surface->backingImage != NULL && surface->backingImage->fds[0] > 0) {
-        /* DRM-backed surface: send per-plane DMA-BUF fds to helper.
-         * The helper imports each into a CUarray, copies to linear, encodes. */
+    if (surface->backingImage != NULL && surface->backingImage->nvFds[0] > 0) {
+        /* DRM-backed surface: send per-plane NVIDIA opaque fds to helper.
+         * The helper imports each into CUDA (cuImportExternalMemory with
+         * OPAQUE_FD), maps to CUarray, copies to linear buffer, encodes.
+         * We dup() the fds because CUDA takes ownership on import. */
         BackingImage *img = surface->backingImage;
         const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
         dp.width = surface->width;
@@ -2086,10 +2088,10 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
         dp.bppc = fmtInfo->bppc;
         dp.is10bit = (nvencCtx->inputFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? 1 : 0;
         for (uint32_t p = 0; p < fmtInfo->numPlanes && p < 4; p++) {
-            dmabuf_fds[p] = img->fds[p];
+            dmabuf_fds[p] = dup(img->nvFds[p]);
             dp.pitches[p] = img->strides[p];
             dp.offsets[p] = 0;
-            dp.sizes[p] = img->size[p];
+            dp.sizes[p] = img->memorySizes[p];
         }
         num_dmabuf_fds = (int)fmtInfo->numPlanes;
         useDmaBuf = true;

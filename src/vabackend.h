@@ -120,6 +120,9 @@ typedef struct _BackingImage {
     //direct backend only
     NVCudaImage cudaImages[3];
     NVFormat    format;
+    /* NVIDIA opaque fds for CUDA import (IPC encode path) */
+    int         nvFds[4];
+    uint32_t    memorySizes[4];
 } BackingImage;
 
 struct _NVDriver;
