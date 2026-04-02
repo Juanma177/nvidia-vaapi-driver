@@ -2067,9 +2067,10 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
     }
 
     /* Encode via IPC.
-     * Priority: 1) DRM-backed surface (realiseSurface → DMA-BUF fd)
-     *           2) Imported DMA-BUF from vaCreateSurfaces attribs
-     *           3) Host pixel data from vaPutImage */
+     * Priority: 1) Host pixel data from vaDeriveImage/vaPutImage (has actual captured pixels)
+     *           2) DRM-backed surface via NVIDIA opaque fds (GPU zero-copy)
+     * Host data takes priority because vaDeriveImage is how Steam writes captured
+     * frames — the GPU surface may exist but not contain the capture. */
     void *bitstream = NULL;
     uint32_t bsSize = 0;
     int ret;
@@ -2077,13 +2078,12 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
     int num_dmabuf_fds = 0;
     NVEncIPCEncodeDmaBufParams dp = {0};
     bool useDmaBuf = false;
+    bool useHostData = false;
 
-    /* Try to realise the surface via DRM backend for GPU-backed memory */
-    if (drv->backend != NULL && surface->backingImage == NULL) {
-        drv->backend->realiseSurface(drv, surface);
-    }
-
-    if (surface->backingImage != NULL && surface->backingImage->nvFds[0] > 0) {
+    /* Prefer host pixel data if available (written by vaDeriveImage → vaMapBuffer) */
+    if (surface->hostPixelData != NULL && surface->hostPixelSize > 0) {
+        useHostData = true;
+    } else if (surface->backingImage != NULL && surface->backingImage->nvFds[0] > 0) {
         /* DRM-backed surface: send per-plane NVIDIA opaque fds to helper.
          * The helper imports each into CUDA (cuImportExternalMemory with
          * OPAQUE_FD), maps to CUarray, copies to linear buffer, encodes.
@@ -2105,7 +2105,17 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
         useDmaBuf = true;
     }
 
-    if (useDmaBuf) {
+    if (useHostData) {
+        /* Host memory path: pixel data from vaDeriveImage/vaPutImage */
+        if (nvencCtx->frameCount < 3) {
+            LOG("IPC encode: HOST path %ux%u %u bytes",
+                nvencCtx->width, nvencCtx->height, surface->hostPixelSize);
+        }
+        ret = nvenc_ipc_encode(nvencCtx->ipcFd, surface->hostPixelData,
+                                nvencCtx->width, nvencCtx->height,
+                                surface->hostPixelSize,
+                                &bitstream, &bsSize);
+    } else if (useDmaBuf) {
         if (nvencCtx->frameCount < 3) {
             LOG("IPC encode: DMABUF planes=%d fds=[%d,%d] %ux%u pitch=%u sizes=[%u,%u]",
                 num_dmabuf_fds, dmabuf_fds[0], dmabuf_fds[1],
@@ -2113,12 +2123,6 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
         }
         ret = nvenc_ipc_encode_dmabuf(nvencCtx->ipcFd, dmabuf_fds, num_dmabuf_fds,
                                        &dp, &bitstream, &bsSize);
-    } else if (surface->hostPixelData != NULL && surface->hostPixelSize > 0) {
-        /* Host memory path: from vaPutImage */
-        ret = nvenc_ipc_encode(nvencCtx->ipcFd, surface->hostPixelData,
-                                nvencCtx->width, nvencCtx->height,
-                                surface->hostPixelSize,
-                                &bitstream, &bsSize);
     } else {
         LOG("IPC encode: surface has no pixel data (no DMA-BUF, no host data)");
         return VA_STATUS_ERROR_OPERATION_FAILED;
