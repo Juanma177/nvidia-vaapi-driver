@@ -1194,7 +1194,10 @@ static VAStatus nvCreateContext(
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
         }
 
-        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
+        if (CHECK_CUDA_RESULT(cu->cuCtxPushCurrent(drv->cudaContext))) {
+            free(nvencCtx);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
 
         if (!nvenc_open_session(nvencCtx, drv->nv, drv->cudaContext)) {
             CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
@@ -1210,7 +1213,11 @@ static VAStatus nvCreateContext(
         nvencCtx->frameRateNum = 30;
         nvencCtx->frameRateDen = 1;
 
-        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+        if (CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL))) {
+            nvenc_close_session(nvencCtx);
+            free(nvencCtx);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
 
         Object contextObj = allocateObject(drv, OBJECT_TYPE_CONTEXT, sizeof(NVContext));
         NVContext *nvCtx = (NVContext*) contextObj->obj;
@@ -1386,6 +1393,20 @@ static VAStatus nvCreateBuffer(
 
     /* Coded buffer for encoding: allocate NVCodedBuffer */
     if (type == VAEncCodedBufferType) {
+        NVCodedBuffer *coded = (NVCodedBuffer*) calloc(1, sizeof(NVCodedBuffer));
+        if (coded == NULL) {
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+
+        /* Pre-allocate the bitstream storage */
+        coded->bitstreamAlloc = size; /* size requested by app is the max coded size */
+        coded->bitstreamData = malloc(size);
+        if (coded->bitstreamData == NULL) {
+            free(coded);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        coded->hasData = false;
+
         Object bufferObject = allocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
         *buf_id = bufferObject->id;
 
@@ -1393,23 +1414,8 @@ static VAStatus nvCreateBuffer(
         buf->bufferType = type;
         buf->elements = 1;
         buf->size = sizeof(NVCodedBuffer);
-        buf->ptr = calloc(1, sizeof(NVCodedBuffer));
+        buf->ptr = coded;
         buf->offset = 0;
-
-        if (buf->ptr == NULL) {
-            return VA_STATUS_ERROR_ALLOCATION_FAILED;
-        }
-
-        /* Pre-allocate the bitstream storage */
-        NVCodedBuffer *coded = (NVCodedBuffer*) buf->ptr;
-        coded->bitstreamAlloc = size; /* size requested by app is the max coded size */
-        coded->bitstreamData = malloc(size);
-        if (coded->bitstreamData == NULL) {
-            free(buf->ptr);
-            buf->ptr = NULL;
-            return VA_STATUS_ERROR_ALLOCATION_FAILED;
-        }
-        coded->hasData = false;
 
         return VA_STATUS_SUCCESS;
     }
@@ -1593,7 +1599,7 @@ static VAStatus nvBeginPicture(
     return VA_STATUS_SUCCESS;
 }
 
-static void nvRenderPictureEncode(NVContext *nvCtx, NVDriver *drv, NVBuffer *buf)
+static void nvRenderPictureEncode(NVContext *nvCtx, NVBuffer *buf)
 {
     NVENCContext *nvencCtx = (NVENCContext*) nvCtx->encodeData;
     bool isH264 = (nvCtx->profile == VAProfileH264ConstrainedBaseline ||
@@ -1605,28 +1611,28 @@ static void nvRenderPictureEncode(NVContext *nvCtx, NVDriver *drv, NVBuffer *buf
         if (isH264) {
             h264enc_handle_sequence_params(nvencCtx, buf);
         } else {
-            hevc_enc_handle_sequence_params(nvencCtx, buf);
+            hevcenc_handle_sequence_params(nvencCtx, buf);
         }
         break;
     case VAEncPictureParameterBufferType:
         if (isH264) {
             h264enc_handle_picture_params(nvencCtx, buf);
         } else {
-            hevc_enc_handle_picture_params(nvencCtx, buf);
+            hevcenc_handle_picture_params(nvencCtx, buf);
         }
         break;
     case VAEncSliceParameterBufferType:
         if (isH264) {
             h264enc_handle_slice_params(nvencCtx, buf);
         } else {
-            hevc_enc_handle_slice_params(nvencCtx, buf);
+            hevcenc_handle_slice_params(nvencCtx, buf);
         }
         break;
     case VAEncMiscParameterBufferType:
         if (isH264) {
             h264enc_handle_misc_params(nvencCtx, buf);
         } else {
-            hevc_enc_handle_misc_params(nvencCtx, buf);
+            hevcenc_handle_misc_params(nvencCtx, buf);
         }
         break;
     case VAEncCodedBufferType:
@@ -1664,7 +1670,7 @@ static VAStatus nvRenderPicture(
         }
 
         if (nvCtx->isEncode) {
-            nvRenderPictureEncode(nvCtx, drv, buf);
+            nvRenderPictureEncode(nvCtx, buf);
             continue;
         }
 
@@ -2279,28 +2285,39 @@ static VAStatus nvPutImage(
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    /* Copy each plane from host memory (image buffer) to GPU (CUarray) */
-    uint32_t offset = 0;
-    uint32_t width = src_width > 0 ? src_width : imageObj->width;
-    uint32_t height = src_height > 0 ? src_height : imageObj->height;
+    /* Copy each plane from host memory (image buffer) to GPU (CUarray).
+     * Apply source/destination offsets per the VA-API spec. */
+    uint32_t copyWidth = src_width > 0 ? src_width : imageObj->width;
+    uint32_t copyHeight = src_height > 0 ? src_height : imageObj->height;
+    uint32_t imgWidth = imageObj->width;
+    uint32_t imgHeight = imageObj->height;
+    uint32_t imgPlaneOffset = 0;
 
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         const NVFormatPlane *p = &fmtInfo->plane[i];
-        uint32_t planeWidth = width >> p->ss.x;
-        uint32_t planeHeight = height >> p->ss.y;
+        /* Subsampled offsets and dimensions */
+        uint32_t planeSrcX = (uint32_t)((src_x > 0 ? src_x : 0)) >> p->ss.x;
+        uint32_t planeSrcY = (uint32_t)((src_y > 0 ? src_y : 0)) >> p->ss.y;
+        uint32_t planeDstX = (uint32_t)((dest_x > 0 ? dest_x : 0)) >> p->ss.x;
+        uint32_t planeDstY = (uint32_t)((dest_y > 0 ? dest_y : 0)) >> p->ss.y;
+        uint32_t planeCopyW = copyWidth >> p->ss.x;
+        uint32_t planeCopyH = copyHeight >> p->ss.y;
+        uint32_t imgPlanePitch = imgWidth * fmtInfo->bppc;
 
         CUDA_MEMCPY2D memcpy2d = {
-            .srcXInBytes = 0, .srcY = 0,
+            .srcXInBytes = planeSrcX * fmtInfo->bppc * p->channelCount,
+            .srcY = planeSrcY,
             .srcMemoryType = CU_MEMORYTYPE_HOST,
-            .srcHost = (char*)imageObj->imageBuffer->ptr + offset,
-            .srcPitch = width * fmtInfo->bppc,
+            .srcHost = (char*)imageObj->imageBuffer->ptr + imgPlaneOffset,
+            .srcPitch = imgPlanePitch,
 
-            .dstXInBytes = 0, .dstY = 0,
+            .dstXInBytes = planeDstX * fmtInfo->bppc * p->channelCount,
+            .dstY = planeDstY,
             .dstMemoryType = CU_MEMORYTYPE_ARRAY,
             .dstArray = backImg->arrays[i],
 
-            .WidthInBytes = planeWidth * fmtInfo->bppc * p->channelCount,
-            .Height = planeHeight,
+            .WidthInBytes = planeCopyW * fmtInfo->bppc * p->channelCount,
+            .Height = planeCopyH,
         };
 
         CUresult result = cu->cuMemcpy2D(&memcpy2d);
@@ -2309,7 +2326,7 @@ static VAStatus nvPutImage(
             CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
             return VA_STATUS_ERROR_OPERATION_FAILED;
         }
-        offset += ((width * height) >> (p->ss.x + p->ss.y)) * fmtInfo->bppc * p->channelCount;
+        imgPlaneOffset += ((imgWidth * imgHeight) >> (p->ss.x + p->ss.y)) * fmtInfo->bppc * p->channelCount;
     }
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);

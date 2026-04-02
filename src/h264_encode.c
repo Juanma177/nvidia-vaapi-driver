@@ -81,7 +81,7 @@ void h264enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
         if (rc->bits_per_second > 0) {
             nvencCtx->maxBitrate = rc->bits_per_second;
             if (rc->target_percentage > 0) {
-                nvencCtx->bitrate = rc->bits_per_second * rc->target_percentage / 100;
+                nvencCtx->bitrate = (uint32_t)((uint64_t)rc->bits_per_second * rc->target_percentage / 100);
             } else {
                 nvencCtx->bitrate = rc->bits_per_second;
             }

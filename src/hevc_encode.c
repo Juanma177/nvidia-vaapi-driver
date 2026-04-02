@@ -9,7 +9,7 @@
  * HEVC VA-API encode buffer handlers.
  */
 
-void hevc_enc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer)
+void hevcenc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
     VAEncSequenceParameterBufferHEVC *seq =
         (VAEncSequenceParameterBufferHEVC*) buffer->ptr;
@@ -34,10 +34,18 @@ void hevc_enc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer)
         nvencCtx->frameRateDen = seq->vui_num_units_in_tick * 2;
     }
 
+    /* Bitrate (VA-API provides in bits/sec) */
+    if (seq->bits_per_second > 0) {
+        nvencCtx->bitrate = seq->bits_per_second;
+        if (nvencCtx->maxBitrate == 0) {
+            nvencCtx->maxBitrate = seq->bits_per_second;
+        }
+    }
+
     nvencCtx->seqParamSet = true;
 }
 
-void hevc_enc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
+void hevcenc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
     VAEncPictureParameterBufferHEVC *pic =
         (VAEncPictureParameterBufferHEVC*) buffer->ptr;
@@ -46,13 +54,13 @@ void hevc_enc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     nvencCtx->currentCodedBufId = pic->coded_buf;
 }
 
-void hevc_enc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)
+void hevcenc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
     (void)nvencCtx;
     (void)buffer;
 }
 
-void hevc_enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
+void hevcenc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
     VAEncMiscParameterBuffer *misc = (VAEncMiscParameterBuffer*) buffer->ptr;
 
@@ -64,7 +72,7 @@ void hevc_enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
         if (rc->bits_per_second > 0) {
             nvencCtx->maxBitrate = rc->bits_per_second;
             if (rc->target_percentage > 0) {
-                nvencCtx->bitrate = rc->bits_per_second * rc->target_percentage / 100;
+                nvencCtx->bitrate = (uint32_t)((uint64_t)rc->bits_per_second * rc->target_percentage / 100);
             } else {
                 nvencCtx->bitrate = rc->bits_per_second;
             }

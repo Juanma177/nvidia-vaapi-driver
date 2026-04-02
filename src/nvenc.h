@@ -12,21 +12,6 @@
  * the context is created with VAEntrypointEncSlice.
  */
 
-/* Maximum number of registered input resources we track per context */
-#define NVENC_MAX_REGISTERED_SURFACES 64
-/* Maximum coded buffer segments we support */
-#define NVENC_MAX_CODED_BUFS 16
-
-typedef struct {
-    CUdeviceptr             devPtr;
-    uint32_t                pitch;
-    NV_ENC_REGISTERED_PTR   registeredResource;
-    NV_ENC_INPUT_PTR        mappedResource;
-    NV_ENC_BUFFER_FORMAT    mappedBufferFmt;
-    bool                    registered;
-    bool                    mapped;
-} NVENCInputSurface;
-
 typedef struct {
     NV_ENC_OUTPUT_PTR       bitstreamBuffer;
     bool                    allocated;

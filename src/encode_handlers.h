@@ -11,9 +11,9 @@ void h264enc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer);
 void h264enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer);
 
 /* HEVC encode buffer handlers */
-void hevc_enc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer);
-void hevc_enc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer);
-void hevc_enc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer);
-void hevc_enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer);
+void hevcenc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer);
+void hevcenc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer);
+void hevcenc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer);
+void hevcenc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer);
 
 #endif /* ENCODE_HANDLERS_H */

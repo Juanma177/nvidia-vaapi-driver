@@ -15,12 +15,6 @@ static bool check_nvenc_status(NVENCSTATUS status, const char *func, int line)
 }
 #define CHECK_NVENC(status) check_nvenc_status(status, __func__, __LINE__)
 
-/* Compare two GUIDs */
-static bool guid_equal(const GUID *a, const GUID *b)
-{
-    return memcmp(a, b, sizeof(GUID)) == 0;
-}
-
 bool nvenc_load(NvencFunctions **nvenc_dl)
 {
     int ret = nvenc_load_functions(nvenc_dl, NULL);
@@ -98,16 +92,16 @@ void nvenc_close_session(NVENCContext *nvencCtx)
         return;
     }
 
-    /* Free output buffer if allocated */
-    nvenc_free_output_buffer(nvencCtx);
-
-    /* Send EOS to flush encoder */
+    /* Send EOS to flush encoder before freeing any buffers */
     if (nvencCtx->initialized) {
         NV_ENC_PIC_PARAMS picParams = {0};
         picParams.version = NV_ENC_PIC_PARAMS_VER;
         picParams.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
         nvencCtx->funcs.nvEncEncodePicture(nvencCtx->encoder, &picParams);
     }
+
+    /* Free output buffer after flush */
+    nvenc_free_output_buffer(nvencCtx);
 
     /* Destroy encoder */
     NVENCSTATUS st = nvencCtx->funcs.nvEncDestroyEncoder(nvencCtx->encoder);
@@ -196,7 +190,7 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
     nvencCtx->initialized = true;
     LOG("NVENC encoder initialized: %ux%u codec=%s",
         width, height,
-        guid_equal(&codecGuid, &NV_ENC_CODEC_H264_GUID) ? "H.264" : "HEVC");
+        memcmp(&codecGuid, &NV_ENC_CODEC_H264_GUID, sizeof(GUID)) == 0 ? "H.264" : "HEVC");
 
     return true;
 }
