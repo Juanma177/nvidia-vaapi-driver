@@ -761,6 +761,9 @@ static void nvGetConfigAttributesEncode(
         case VAConfigAttribMaxPictureHeight:
             attrib_list[i].value = 4096;
             break;
+        case VAConfigAttribEncQualityRange:
+            attrib_list[i].value = 7; //NVENC presets P1-P7
+            break;
         default:
             attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
             break;

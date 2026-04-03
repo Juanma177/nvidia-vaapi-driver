@@ -38,6 +38,8 @@ typedef struct {
     uint32_t                        frameRateDen;
     uint32_t                        intraPeriod;    //GOP length
     uint32_t                        ipPeriod;
+    uint32_t                        vbvBufferSize;  //HRD buffer size (bits)
+    uint32_t                        vbvInitialDelay; //HRD initial fullness (bits)
     uint64_t                        frameCount;
     NVENCOutputBuffer               outputBuffer;
     VABufferID                      currentCodedBufId;

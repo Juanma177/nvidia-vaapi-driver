@@ -119,8 +119,10 @@ void h264enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     case VAEncMiscParameterTypeHRD: {
         VAEncMiscParameterHRD *hrd =
             (VAEncMiscParameterHRD*) misc->data;
-        LOG("H264 encode: HRD buffer_size=%u", hrd->buffer_size);
-        (void)hrd;
+        if (hrd->buffer_size > 0)
+            nvencCtx->vbvBufferSize = hrd->buffer_size;
+        if (hrd->initial_buffer_fullness > 0)
+            nvencCtx->vbvInitialDelay = hrd->initial_buffer_fullness;
         break;
     }
     default:

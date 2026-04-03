@@ -146,6 +146,12 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
     if (nvencCtx->maxBitrate > 0) {
         nvencCtx->encodeConfig.rcParams.maxBitRate = nvencCtx->maxBitrate;
     }
+    if (nvencCtx->vbvBufferSize > 0) {
+        nvencCtx->encodeConfig.rcParams.vbvBufferSize = nvencCtx->vbvBufferSize;
+    }
+    if (nvencCtx->vbvInitialDelay > 0) {
+        nvencCtx->encodeConfig.rcParams.vbvInitialDelay = nvencCtx->vbvInitialDelay;
+    }
 
     if (nvencCtx->intraPeriod > 0) {
         nvencCtx->encodeConfig.gopLength = nvencCtx->intraPeriod;

@@ -106,8 +106,16 @@ void hevcenc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
         }
         break;
     }
+    case VAEncMiscParameterTypeHRD: {
+        VAEncMiscParameterHRD *hrd =
+            (VAEncMiscParameterHRD*) misc->data;
+        if (hrd->buffer_size > 0)
+            nvencCtx->vbvBufferSize = hrd->buffer_size;
+        if (hrd->initial_buffer_fullness > 0)
+            nvencCtx->vbvInitialDelay = hrd->initial_buffer_fullness;
+        break;
+    }
     default:
-        LOG("HEVC encode: unhandled misc param type %d", misc->type);
         break;
     }
 }

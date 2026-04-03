@@ -108,6 +108,16 @@ static void test_config_max_ref_frames(void) {
     TEST_PASS();
 }
 
+static void test_config_quality_range(void) {
+    TEST_START("Quality range attribute reported");
+    VAConfigAttrib a = { .type = VAConfigAttribEncQualityRange };
+    EXPECT_STATUS(vaGetConfigAttributes(g_dpy, VAProfileH264High,
+                                         VAEntrypointEncSlice, &a, 1));
+    EXPECT_TRUE(a.value != VA_ATTRIB_NOT_SUPPORTED, "not supported");
+    EXPECT_TRUE(a.value >= 1, "quality range < 1");
+    TEST_PASS();
+}
+
 /* --- Error path tests --- */
 
 static void test_invalid_entrypoint(void) {
@@ -227,6 +237,7 @@ int main(void)
     test_config_ratecontrol();
     test_config_packed_headers();
     test_config_max_ref_frames();
+    test_config_quality_range();
 
     printf("\nError paths:\n");
     test_invalid_entrypoint();
