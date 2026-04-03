@@ -1244,7 +1244,9 @@ static VAStatus nvDestroySurfaces(
 
         LOG("Destroying surface %d (%p)", surface->pictureIdx, surface);
 
-        free(surface->hostPixelData);
+        if (!surface->hostPixelIsShm) {
+            free(surface->hostPixelData);
+        }
         surface->hostPixelData = NULL;
 
         if (surface->importedDmaBufFd >= 0) {
@@ -2092,7 +2094,22 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
             } else {
                 nvencCtx->shmSize = shm_size;
                 nvencCtx->shmFd = shm_fd;
-                LOG("IPC encode: shm enabled, %u bytes", shm_size);
+
+                /* Redirect the surface's hostPixelData to the SHM region.
+                 * This eliminates the memcpy in EndPicture — Steam writes
+                 * directly to shared memory via vaDeriveImage → vaMapBuffer.
+                 * The helper reads from the same physical pages. Zero copy. */
+                if (surface->hostPixelSize <= shm_size) {
+                    if (!surface->hostPixelIsShm) {
+                        free(surface->hostPixelData);
+                    }
+                    surface->hostPixelData = nvencCtx->shmPtr;
+                    surface->hostPixelSize = shm_size;
+                    surface->hostPixelIsShm = true;
+                    LOG("IPC encode: shm zero-copy enabled, %u bytes", shm_size);
+                } else {
+                    LOG("IPC encode: shm enabled (copy mode), %u bytes", shm_size);
+                }
             }
             close(shm_fd); /* mmap keeps the mapping alive after close */
         }
@@ -2151,9 +2168,11 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
         nvencCtx->forceIDR = false;
 
         if (nvencCtx->shmPtr != NULL && frameSize <= nvencCtx->shmSize) {
-            /* SHM path: copy frame to shared memory, send small signal only.
-             * Saves ~6ms by avoiding 3MB socket send+recv. */
-            memcpy(nvencCtx->shmPtr, surface->hostPixelData, frameSize);
+            /* SHM path: if hostPixelData IS the shm (zero-copy), skip memcpy.
+             * Otherwise copy frame to shared memory. */
+            if (surface->hostPixelData != nvencCtx->shmPtr) {
+                memcpy(nvencCtx->shmPtr, surface->hostPixelData, frameSize);
+            }
             if (nvencCtx->frameCount < 3) {
                 LOG("IPC encode: SHM path %ux%u %u bytes", surfW, surfH, frameSize);
             }

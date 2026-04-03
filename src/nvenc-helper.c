@@ -317,35 +317,40 @@ static bool encoder_encode(HelperEncoder *enc, const void *frame_data,
 
     /* Copy NV12/P010 data into NVENC's buffer, respecting pitch.
      * frame_height may be smaller than enc->height (e.g. 1080 vs 1088)
-     * because the encoder uses MB-aligned height. Zero-fill padding rows. */
+     * because the encoder uses MB-aligned height. */
     uint32_t bpp = enc->is10bit ? 2 : 1;
     uint32_t srcPitch = frame_width * bpp;
     uint32_t dstPitch = lockIn.pitch;
     uint8_t *src = (uint8_t *)frame_data;
     uint8_t *dst = (uint8_t *)lockIn.bufferDataPtr;
-
-    /* Zero luma + chroma regions separately to avoid writing beyond the buffer.
-     * NVENC's locked buffer size is at least dstPitch * height * 1.5 but
-     * we only zero what we know is safe. */
-    memset(dst, 0, dstPitch * enc->height);                              /* luma */
-    memset(dst + dstPitch * enc->height, 128, dstPitch * enc->height / 2); /* chroma (128=neutral UV) */
-
-    /* Copy luma — only frame_height lines from the source */
-    for (uint32_t y = 0; y < frame_height; y++) {
-        memcpy(dst + y * dstPitch, src + y * srcPitch, srcPitch);
-    }
-
-    /* Copy chroma (NV12: interleaved UV, half height).
-     * Source chroma starts at srcPitch * frame_height.
-     * Dest chroma starts at dstPitch * enc->height (encoder's full height). */
     uint32_t chromaOffset_src = srcPitch * frame_height;
     uint32_t chromaOffset_dst = dstPitch * enc->height;
     uint32_t chromaHeight = frame_height / 2;
+    uint32_t padLines = enc->height - frame_height;
 
-    for (uint32_t y = 0; y < chromaHeight; y++) {
-        memcpy(dst + chromaOffset_dst + y * dstPitch,
-               src + chromaOffset_src + y * srcPitch,
-               srcPitch);
+    /* Fast path: if pitches match, use bulk memcpy instead of line-by-line */
+    if (srcPitch == dstPitch) {
+        memcpy(dst, src, srcPitch * frame_height);
+        memcpy(dst + chromaOffset_dst, src + chromaOffset_src, srcPitch * chromaHeight);
+    } else {
+        /* Pitch mismatch: line-by-line copy */
+        for (uint32_t y = 0; y < frame_height; y++) {
+            memcpy(dst + y * dstPitch, src + y * srcPitch, srcPitch);
+        }
+        for (uint32_t y = 0; y < chromaHeight; y++) {
+            memcpy(dst + chromaOffset_dst + y * dstPitch,
+                   src + chromaOffset_src + y * srcPitch,
+                   srcPitch);
+        }
+    }
+
+    /* Only zero the MB-alignment padding rows (e.g. 8 rows for 1080→1088).
+     * Skipped entirely when frame_height == enc->height (no padding). */
+    if (padLines > 0) {
+        /* Luma padding: black (0) */
+        memset(dst + dstPitch * frame_height, 0, dstPitch * padLines);
+        /* Chroma padding: neutral gray (128) */
+        memset(dst + chromaOffset_dst + dstPitch * chromaHeight, 128, dstPitch * (padLines / 2));
     }
 
     st = enc->funcs.nvEncUnlockInputBuffer(enc->encoder, enc->inputBuffer);

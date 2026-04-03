@@ -73,6 +73,7 @@ typedef struct
     /* Host-memory pixel buffer for encode-only IPC path (no CUDA) */
     void                   *hostPixelData;
     uint32_t                hostPixelSize;
+    bool                    hostPixelIsShm; /* true if hostPixelData points to SHM (don't free) */
     /* Imported DMA-BUF for IPC encode (fd from Steam's GPU capture) */
     int                     importedDmaBufFd;
     uint32_t                importedPitches[4];
