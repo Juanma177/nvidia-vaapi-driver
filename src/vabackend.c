@@ -748,8 +748,12 @@ static void nvGetConfigAttributesEncode(
             attrib_list[i].value = VA_RC_CQP | VA_RC_CBR | VA_RC_VBR;
             break;
         case VAConfigAttribEncPackedHeaders:
+            //accept all packed header types; NVENC generates its own but
+            //apps (Steam) expect the driver to accept them without warning
             attrib_list[i].value = VA_ENC_PACKED_HEADER_SEQUENCE
-                                 | VA_ENC_PACKED_HEADER_PICTURE;
+                                 | VA_ENC_PACKED_HEADER_PICTURE
+                                 | VA_ENC_PACKED_HEADER_SLICE
+                                 | VA_ENC_PACKED_HEADER_MISC;
             break;
         case VAConfigAttribEncMaxRefFrames:
             /* NVENC supports multiple reference frames; report a safe value */
