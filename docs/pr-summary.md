@@ -134,7 +134,7 @@ From streaming logs, Steam's ffmpeg VA-API encode pipeline uses:
 | Rate control misc (bits_per_second, target_percentage) | Yes | Applied to NVENC RC |
 | Framerate misc | Yes | Applied |
 | HRD misc (buffer_size) | Yes (type 5) | Applied to NVENC vbvBufferSize |
-| Packed headers (SEQ+PIC+SLICE) | Wants 0xd, gets 0x3 | Warning logged, works fine — NVENC generates all headers |
+| Packed headers (SEQ+PIC+SLICE+MISC) | Yes | Accepted (NVENC generates its own, no warning) |
 | Quality level | quality=0 (default) | VAConfigAttribEncQualityRange reported, not queried by Steam |
 | vaDeriveImage + vaMapBuffer | Yes (every frame) | Implemented, zero-copy SHM redirect |
 | vaExportSurfaceHandle | No | Implemented but Steam doesn't call it |
@@ -150,7 +150,7 @@ Not a problem: B-frames add latency, which is the opposite of what streaming nee
 
 ### Packed headers
 
-NVENC generates its own SPS/PPS/VPS headers. Application-provided packed headers are accepted but not injected. Works fine for ffmpeg and Steam.
+Driver advertises full packed header support (SEQ+PIC+SLICE+MISC). NVENC generates its own SPS/PPS/VPS headers internally. Application-provided packed headers are accepted and silently skipped.
 
 ### 32-bit encode-only
 
@@ -204,7 +204,7 @@ PR #425 by alper-han also adds NVENC encoding. Key differences:
 | Codecs | H.264 only | H.264 + HEVC + Main10 |
 | 32-bit Steam | Not addressed | Full shared memory bridge |
 | B-frames | Supported | Disabled (ffmpeg compat) |
-| Packed headers | Full support | NVENC-generated only |
+| Packed headers | Full support | Accepted, NVENC-generated |
 | File count | 27 files changed | 12 new + 4 modified |
 | Steam tested | Not mentioned | Verified on Mac + Legion Go |
 
