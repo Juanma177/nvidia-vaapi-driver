@@ -5,49 +5,58 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PREFIX="${PREFIX:-/usr}"
 
 echo "=== nvidia-vaapi-driver installer ==="
-echo "Source: $SCRIPT_DIR"
-echo "Prefix: $PREFIX"
 echo ""
 
-# Check dependencies
-echo "[1/7] Checking dependencies..."
-for cmd in meson ninja gcc pkg-config; do
-    command -v $cmd >/dev/null || { echo "ERROR: $cmd not found"; exit 1; }
-done
-pkg-config --exists libva ffnvcodec libdrm egl || { echo "ERROR: missing dev packages"; exit 1; }
+# Detect NVIDIA driver version
+NV_VER=$(dpkg -l 2>/dev/null | grep 'libnvidia-compute-.*amd64' | awk '{print $2}' | sed 's/libnvidia-compute-//' | sed 's/:amd64//' | head -1)
+if [ -z "$NV_VER" ]; then
+    echo "ERROR: NVIDIA driver not detected. Install the NVIDIA driver first."
+    exit 1
+fi
+echo "NVIDIA driver: $NV_VER"
+
+# Install build dependencies
+echo ""
+echo "[1/7] Installing build dependencies..."
+sudo apt-get install -y --no-install-recommends \
+    meson ninja-build gcc pkg-config \
+    libva-dev libdrm-dev libegl-dev libffmpeg-nvenc-dev \
+    2>&1 | tail -1
+
+# 32-bit dependencies (for Steam Remote Play)
+echo "[2/7] Installing 32-bit dependencies (for Steam)..."
+if ! dpkg --print-foreign-architectures 2>/dev/null | grep -q i386; then
+    sudo dpkg --add-architecture i386
+    sudo apt-get update -qq 2>&1 | tail -1
+fi
+sudo apt-get install -y --no-install-recommends \
+    gcc-multilib \
+    libva-dev:i386 libdrm-dev:i386 libegl-dev:i386 \
+    libnvidia-compute-${NV_VER}:i386 \
+    libnvidia-encode-${NV_VER}:i386 \
+    2>&1 | tail -1
 
 # Build 64-bit
-echo "[2/7] Building 64-bit driver + helper..."
+echo "[3/7] Building 64-bit driver + helper..."
 meson setup "$SCRIPT_DIR/build64" "$SCRIPT_DIR" --wipe --prefix="$PREFIX" 2>&1 | tail -3
 meson compile -C "$SCRIPT_DIR/build64" 2>&1 | tail -1
 
-# Build 32-bit (optional)
-echo "[3/7] Building 32-bit driver (cross-compile)..."
-if [ -f "$SCRIPT_DIR/cross-i386.txt" ] && dpkg --print-foreign-architectures 2>/dev/null | grep -q i386; then
-    if pkg-config --exists libva libdrm egl 2>/dev/null; then
-        meson setup "$SCRIPT_DIR/build32" "$SCRIPT_DIR" --wipe --cross-file "$SCRIPT_DIR/cross-i386.txt" 2>&1 | tail -3
-        meson compile -C "$SCRIPT_DIR/build32" 2>&1 | tail -1
-        HAS_32BIT=1
-    else
-        echo "  Skipped: missing i386 dev packages"
-        HAS_32BIT=0
-    fi
-else
-    echo "  Skipped: i386 architecture not enabled"
-    HAS_32BIT=0
+# Build 32-bit
+echo "[4/7] Building 32-bit driver (cross-compile)..."
+HAS_32BIT=0
+if [ -f "$SCRIPT_DIR/cross-i386.txt" ]; then
+    meson setup "$SCRIPT_DIR/build32" "$SCRIPT_DIR" --wipe --cross-file "$SCRIPT_DIR/cross-i386.txt" 2>&1 | tail -3
+    meson compile -C "$SCRIPT_DIR/build32" 2>&1 | tail -1
+    HAS_32BIT=1
 fi
 
 # Install
-echo "[4/7] Installing 64-bit driver + helper..."
+echo "[5/7] Installing drivers + helper..."
 sudo meson install -C "$SCRIPT_DIR/build64" 2>&1 | tail -2
-
 if [ "$HAS_32BIT" = "1" ]; then
-    echo "[5/7] Installing 32-bit driver..."
     sudo mkdir -p /usr/lib/i386-linux-gnu/dri
     sudo cp "$SCRIPT_DIR/build32/nvidia_drv_video.so" /usr/lib/i386-linux-gnu/dri/nvidia_drv_video.so
-    echo "  Installed to /usr/lib/i386-linux-gnu/dri/"
-else
-    echo "[5/7] Skipping 32-bit install"
+    echo "  32-bit driver installed"
 fi
 
 # Systemd user service
@@ -73,34 +82,20 @@ systemctl --user daemon-reload
 systemctl --user enable nvenc-helper.service
 systemctl --user restart nvenc-helper.service
 
+# Verify
 echo "[7/7] Verifying..."
 sleep 1
 
-# Verify helper
-if systemctl --user is-active nvenc-helper.service >/dev/null 2>&1; then
-    echo "  nvenc-helper: running"
-else
-    echo "  nvenc-helper: FAILED (check: systemctl --user status nvenc-helper)"
-fi
+systemctl --user is-active nvenc-helper.service >/dev/null 2>&1 \
+    && echo "  nvenc-helper: running" \
+    || echo "  nvenc-helper: FAILED"
 
-# Verify 64-bit driver
-if vainfo --display drm --device /dev/dri/renderD128 2>&1 | grep -q 'VAEntrypointEncSlice'; then
-    echo "  64-bit encode: OK"
-else
-    echo "  64-bit encode: FAILED"
-fi
+vainfo --display drm --device /dev/dri/renderD128 2>&1 | grep -q 'VAEntrypointEncSlice' \
+    && echo "  64-bit encode: OK" \
+    || echo "  64-bit encode: FAILED"
 
-# Verify 32-bit driver
-if [ "$HAS_32BIT" = "1" ]; then
-    echo "  32-bit driver: installed at /usr/lib/i386-linux-gnu/dri/nvidia_drv_video.so"
-fi
+[ "$HAS_32BIT" = "1" ] && echo "  32-bit driver: OK"
 
 echo ""
 echo "=== Done ==="
-echo "Files installed:"
-echo "  /usr/lib/x86_64-linux-gnu/dri/nvidia_drv_video.so  (64-bit VA-API driver)"
-[ "$HAS_32BIT" = "1" ] && echo "  /usr/lib/i386-linux-gnu/dri/nvidia_drv_video.so   (32-bit VA-API driver)"
-echo "  /usr/libexec/nvenc-helper                           (64-bit encode daemon)"
-echo "  ~/.config/systemd/user/nvenc-helper.service         (systemd user service)"
-echo ""
-echo "No environment variables needed. Steam Remote Play should work automatically."
+echo "No environment variables needed. Just launch Steam."
