@@ -157,18 +157,20 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
         nvencCtx->encodeConfig.gopLength = nvencCtx->intraPeriod;
     }
     /*
-     * Force frameIntervalP=1 (no B-frames) for synchronous encode.
+     * B-frames are disabled (frameIntervalP=1).
      *
-     * NVENC with B-frames returns NV_ENC_ERR_NEED_MORE_INPUT for
-     * non-reference frames, producing empty coded buffers. While our
-     * nvenc_encode_frame handles this (returns 0), ffmpeg's vaapi_encode
-     * (at least through version 6.x) asserts on empty coded buffers.
+     * NVENC with enablePTD=0 and B-frames requires full DPB (Decoded Picture
+     * Buffer) reference frame management from the caller — specifying which
+     * frames are references, managing the reference picture list, and setting
+     * up the codec-specific reference frame structures. This is what Intel's
+     * VA-API driver does internally with its hardware encoder.
      *
-     * No B-frames is also optimal for the primary use case (low-latency
-     * game streaming via Steam Remote Play). For offline transcoding
-     * where B-frames would improve compression, users can use the native
-     * ffmpeg NVENC encoder (h264_nvenc / hevc_nvenc) which has full
-     * B-frame support.
+     * With enablePTD=1, NVENC handles references internally but returns
+     * NV_ENC_ERR_NEED_MORE_INPUT for B-frames, which ffmpeg 6.x vaapi_encode
+     * doesn't support (asserts on empty coded buffers).
+     *
+     * No B-frames is optimal for the primary use case (low-latency streaming).
+     * For offline encoding with B-frames, use h264_nvenc/hevc_nvenc directly.
      */
     nvencCtx->encodeConfig.frameIntervalP = 1;
 

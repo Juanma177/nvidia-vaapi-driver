@@ -1957,7 +1957,7 @@ static VAStatus nvEndPictureEncode(NVDriver *drv, NVContext *nvCtx)
     nvencCtx->forceIDR = false;
     int encResult = nvenc_encode_frame(nvencCtx, mappedResource, mappedFmt,
                                        encWidth, encHeight, pitch,
-                                       NV_ENC_PIC_TYPE_UNKNOWN, picFlags);
+                                       nvencCtx->picType, picFlags);
 
     /* Unmap and unregister regardless of encode result */
     nvenc_unmap_resource(nvencCtx, mappedResource);

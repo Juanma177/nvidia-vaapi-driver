@@ -59,8 +59,26 @@ void hevcenc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 
 void hevcenc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
-    (void)nvencCtx;
-    (void)buffer;
+    VAEncSliceParameterBufferHEVC *slice =
+        (VAEncSliceParameterBufferHEVC*) buffer->ptr;
+
+    /* Map VA-API HEVC slice_type to NVENC picture type.
+     * HEVC slice types: 0=B, 1=P, 2=I */
+    switch (slice->slice_type) {
+    case 2: /* I */
+        nvencCtx->picType = nvencCtx->forceIDR
+            ? NV_ENC_PIC_TYPE_IDR : NV_ENC_PIC_TYPE_I;
+        break;
+    case 1: /* P */
+        nvencCtx->picType = NV_ENC_PIC_TYPE_P;
+        break;
+    case 0: /* B */
+        nvencCtx->picType = NV_ENC_PIC_TYPE_B;
+        break;
+    default:
+        nvencCtx->picType = NV_ENC_PIC_TYPE_UNKNOWN;
+        break;
+    }
 }
 
 void hevcenc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)

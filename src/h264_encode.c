@@ -68,10 +68,26 @@ void h264enc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 
 void h264enc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
-    (void)nvencCtx;
-    (void)buffer;
-    /* VAEncSliceParameterBufferH264 contains per-slice params.
-     * NVENC handles slicing internally. */
+    VAEncSliceParameterBufferH264 *slice =
+        (VAEncSliceParameterBufferH264*) buffer->ptr;
+
+    /* Map VA-API H.264 slice_type to NVENC picture type.
+     * Currently unused (enablePTD=1), but kept for future B-frame support. */
+    switch (slice->slice_type) {
+    case 2: case 7: /* I / SI */
+        nvencCtx->picType = nvencCtx->forceIDR
+            ? NV_ENC_PIC_TYPE_IDR : NV_ENC_PIC_TYPE_I;
+        break;
+    case 0: case 5: /* P / SP */
+        nvencCtx->picType = NV_ENC_PIC_TYPE_P;
+        break;
+    case 1: case 6: /* B */
+        nvencCtx->picType = NV_ENC_PIC_TYPE_B;
+        break;
+    default:
+        nvencCtx->picType = NV_ENC_PIC_TYPE_UNKNOWN;
+        break;
+    }
 }
 
 void h264enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)

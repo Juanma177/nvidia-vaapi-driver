@@ -61,6 +61,8 @@ typedef struct {
     VABufferID                      currentCodedBufId;
     /* Force IDR on next frame (set by picture params idr_pic_flag) */
     bool                            forceIDR;
+    /* Picture type from VA-API slice params (used when enablePTD=0) */
+    NV_ENC_PIC_TYPE                 picType;
     /* IPC mode: encode via 64-bit helper when CUDA is unavailable */
     bool                            useIPC;
     int                             ipcFd;   /* socket to nvenc-helper, -1 if not connected */
