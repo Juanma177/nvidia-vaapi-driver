@@ -89,6 +89,8 @@ typedef struct {
     uint32_t                    height;
     uint32_t                    is10bit;
     uint64_t                    frameCount;
+    uint8_t                    *bsBuf;         /* pre-allocated bitstream output */
+    uint32_t                    bsBufSize;
 } HelperEncoder;
 
 /* Reliable I/O */
@@ -295,6 +297,8 @@ static bool encoder_init(HelperEncoder *enc, const NVEncIPCInitParams *params)
     enc->height = params->height;
     enc->is10bit = params->is10bit;
     enc->frameCount = 0;
+    enc->bsBufSize = 4 * 1024 * 1024;
+    enc->bsBuf = malloc(enc->bsBufSize);
     enc->initialized = true;
 
     /* Allocate persistent CUDA linear buffer for GPU-side encode.
@@ -533,12 +537,20 @@ do_encode:;
 
     /* Copy bitstream data */
     *out_size = lockOut.bitstreamSizeInBytes;
-    *out_data = malloc(lockOut.bitstreamSizeInBytes);
-    if (*out_data == NULL) {
-        enc->funcs.nvEncUnlockBitstream(enc->encoder, enc->outputBuffer);
-        return false;
+
+    //grow pre-allocated buffer if needed
+    if (lockOut.bitstreamSizeInBytes > enc->bsBufSize) {
+        uint32_t newSize = lockOut.bitstreamSizeInBytes + (lockOut.bitstreamSizeInBytes >> 1);
+        uint8_t *newBuf = realloc(enc->bsBuf, newSize);
+        if (newBuf == NULL) {
+            enc->funcs.nvEncUnlockBitstream(enc->encoder, enc->outputBuffer);
+            return false;
+        }
+        enc->bsBuf = newBuf;
+        enc->bsBufSize = newSize;
     }
-    memcpy(*out_data, lockOut.bitstreamBufferPtr, lockOut.bitstreamSizeInBytes);
+    memcpy(enc->bsBuf, lockOut.bitstreamBufferPtr, lockOut.bitstreamSizeInBytes);
+    *out_data = enc->bsBuf;
 
     enc->funcs.nvEncUnlockBitstream(enc->encoder, enc->outputBuffer);
 
@@ -581,6 +593,9 @@ static void encoder_close(HelperEncoder *enc)
         enc->cudaCtx = NULL;
     }
 
+    free(enc->bsBuf);
+    enc->bsBuf = NULL;
+    enc->bsBufSize = 0;
     enc->initialized = false;
     HELPER_LOG("Encoder closed (encoded %lu frames)", (unsigned long)enc->frameCount);
 }
@@ -596,6 +611,18 @@ static void handle_client(int client_fd)
     HELPER_LOG("Client connected (fd=%d)", client_fd);
 
     while (running) {
+        //wait for data with 5s timeout (detect dead clients)
+        struct pollfd cpfd = { .fd = client_fd, .events = POLLIN };
+        int pr = poll(&cpfd, 1, 5000);
+        if (pr == 0) {
+            HELPER_LOG("Client timeout (5s), disconnecting");
+            break;
+        }
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
         NVEncIPCMsgHeader hdr;
         if (!recv_all(client_fd, &hdr, sizeof(hdr))) {
             HELPER_LOG("Client disconnected");
@@ -625,7 +652,6 @@ static void handle_client(int client_fd)
                 shm_fd = -1;
             }
 
-            cu->cuCtxPushCurrent(NULL);
             bool ok = encoder_init(&enc, &params);
             if (!ok) {
                 send_response(client_fd, -1, NULL, 0);
@@ -700,18 +726,15 @@ static void handle_client(int client_fd)
                 goto done;
             }
 
-            cu->cuCtxPushCurrent(enc.cudaCtx);
 
             void *bitstream = NULL;
             uint32_t bsSize = 0;
             bool ok = encoder_encode(&enc, frame, ep.width, ep.height, ep.frame_size, ep.force_idr, &bitstream, &bsSize);
             free(frame);
 
-            cu->cuCtxPopCurrent(NULL);
 
             if (ok) {
                 send_response(client_fd, 0, bitstream, bsSize);
-                free(bitstream);
             } else {
                 send_response(client_fd, -1, NULL, 0);
             }
@@ -769,7 +792,6 @@ static void handle_client(int client_fd)
                 break;
             }
 
-            cu->cuCtxPushCurrent(enc.cudaCtx);
 
             if (enc.frameCount < 3) {
                 HELPER_LOG("DMABUF: fds=[%d,%d] %ux%u planes=%u bppc=%u sizes=[%u,%u]",
@@ -847,7 +869,6 @@ static void handle_client(int client_fd)
                 for (int i = (int)dp.num_planes; i < num_fds; i++) {
                     if (dmabuf_fds[i] >= 0) close(dmabuf_fds[i]);
                 }
-                cu->cuCtxPopCurrent(NULL);
                 send_response(client_fd, -1, NULL, 0);
                 break;
             }
@@ -985,7 +1006,6 @@ dmabuf_cleanup:
                 if (mipmaps[i]) cu->cuMipmappedArrayDestroy(mipmaps[i]);
                 if (extMems[i]) cu->cuDestroyExternalMemory(extMems[i]);
             }
-            cu->cuCtxPopCurrent(NULL);
             break;
         }
 
@@ -1003,7 +1023,6 @@ dmabuf_cleanup:
             NVEncIPCEncodeShmParams sp;
             if (!recv_all(client_fd, &sp, sizeof(sp))) goto done;
 
-            cu->cuCtxPushCurrent(enc.cudaCtx);
 
             /* Encode directly from shared memory — no socket data transfer */
             void *bitstream = NULL;
@@ -1012,11 +1031,9 @@ dmabuf_cleanup:
                                      sp.frame_size, sp.force_idr,
                                      &bitstream, &bsSize);
 
-            cu->cuCtxPopCurrent(NULL);
 
             if (ok) {
                 send_response(client_fd, 0, bitstream, bsSize);
-                free(bitstream);
             } else {
                 send_response(client_fd, -1, NULL, 0);
             }
@@ -1112,16 +1129,16 @@ int main(int argc, char **argv)
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
+    mode_t old_umask = umask(0077); //socket created with 0700 permissions
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         HELPER_LOG("bind(%s): %s", sock_path, strerror(errno));
+        umask(old_umask);
         close(listen_fd);
         return 1;
     }
+    umask(old_umask);
 
-    /* Restrict socket permissions to current user */
-    chmod(sock_path, 0700);
-
-    if (listen(listen_fd, 2) < 0) {
+    if (listen(listen_fd, 8) < 0) {
         HELPER_LOG("listen: %s", strerror(errno));
         close(listen_fd);
         unlink(sock_path);
@@ -1147,12 +1164,6 @@ int main(int argc, char **argv)
             HELPER_LOG("accept: %s", strerror(errno));
             continue; /* Don't exit on accept error — keep listening */
         }
-
-        /* Set recv timeout so we detect dead clients instead of blocking forever.
-         * A streaming encode at 60fps sends a frame every ~16ms.
-         * 5 seconds of silence means the client is gone. */
-        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         /* Handle one client at a time (sufficient for Steam's single encode stream) */
         handle_client(client_fd);
