@@ -71,7 +71,7 @@ Getting from "vainfo shows EncSlice" to "Steam Remote Play actually works" requi
 | Suite | Tests | Status |
 |-------|-------|--------|
 | `test_encode` — full encode cycles, leak checks | 11 | All PASS |
-| `test_encode_config` — capabilities, error paths, surfaces | 34 | All PASS |
+| `test_encode_config` — capabilities, error paths, surfaces | 35 | All PASS |
 
 ### Manual integration tests
 
@@ -122,6 +122,23 @@ All code reviewed for production reliability:
 - Derived image buffer ownership tracked (sentinel prevents double-free)
 - DMA-BUF fds properly closed on partial import failure
 - NVIDIA opaque fds closed in surface destroy
+
+## What Steam actually uses
+
+From streaming logs, Steam's ffmpeg VA-API encode pipeline uses:
+
+| VA-API feature | Used by Steam | Status |
+|---|---|---|
+| Sequence params (resolution, bitrate, framerate, GOP) | Yes | Fully mapped to NVENC |
+| Picture params (coded_buf, idr_pic_flag) | Yes | Working, IDR forwarded |
+| Rate control misc (bits_per_second, target_percentage) | Yes | Applied to NVENC RC |
+| Framerate misc | Yes | Applied |
+| HRD misc (buffer_size) | Yes (type 5) | Applied to NVENC vbvBufferSize |
+| Packed headers (SEQ+PIC+SLICE) | Wants 0xd, gets 0x3 | Warning logged, works fine — NVENC generates all headers |
+| Quality level | quality=0 (default) | VAConfigAttribEncQualityRange reported, not queried by Steam |
+| vaDeriveImage + vaMapBuffer | Yes (every frame) | Implemented, zero-copy SHM redirect |
+| vaExportSurfaceHandle | No | Implemented but Steam doesn't call it |
+| vaPutImage | No | Implemented but Steam uses vaDeriveImage instead |
 
 ## Known limitations
 
