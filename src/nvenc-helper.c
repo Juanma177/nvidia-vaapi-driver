@@ -29,6 +29,7 @@
 #include <time.h>
 #include <poll.h>
 #include <sys/time.h>
+#include <sys/mman.h>
 
 #include <ffnvcodec/dynlink_loader.h>
 #include <ffnvcodec/nvEncodeAPI.h>
@@ -109,6 +110,41 @@ static bool send_response(int fd, int32_t status, const void *data, uint32_t siz
     if (!send_all(fd, &resp, sizeof(resp))) return false;
     if (size > 0 && data != NULL) {
         if (!send_all(fd, data, size)) return false;
+    }
+    return true;
+}
+
+/* Send response header with an fd attached via SCM_RIGHTS */
+static bool send_response_with_fd(int sock, int32_t status, int send_fd,
+                                   const void *data, uint32_t size)
+{
+    NVEncIPCRespHeader resp = { .status = status, .payload_size = size };
+
+    struct iovec iov = { .iov_base = &resp, .iov_len = sizeof(resp) };
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } cmsg_buf;
+    memset(&cmsg_buf, 0, sizeof(cmsg_buf));
+
+    struct msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = cmsg_buf.buf,
+        .msg_controllen = sizeof(cmsg_buf.buf),
+    };
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &send_fd, sizeof(int));
+
+    ssize_t n = sendmsg(sock, &msg, MSG_NOSIGNAL);
+    if (n != sizeof(resp)) return false;
+
+    if (size > 0 && data != NULL) {
+        if (!send_all(sock, data, size)) return false;
     }
     return true;
 }
@@ -404,6 +440,9 @@ static void encoder_close(HelperEncoder *enc)
 static void handle_client(int client_fd)
 {
     HelperEncoder enc = {0};
+    void *shm_ptr = MAP_FAILED;
+    uint32_t shm_size = 0;
+    int shm_fd = -1;
 
     HELPER_LOG("Client connected (fd=%d)", client_fd);
 
@@ -427,9 +466,53 @@ static void handle_client(int client_fd)
                 encoder_close(&enc);
             }
 
-            cu->cuCtxPushCurrent(NULL); /* Ensure clean CUDA state */
+            /* Clean up old shm if any */
+            if (shm_ptr != MAP_FAILED) {
+                munmap(shm_ptr, shm_size);
+                shm_ptr = MAP_FAILED;
+            }
+            if (shm_fd >= 0) {
+                close(shm_fd);
+                shm_fd = -1;
+            }
+
+            cu->cuCtxPushCurrent(NULL);
             bool ok = encoder_init(&enc, &params);
-            send_response(client_fd, ok ? 0 : -1, NULL, 0);
+            if (!ok) {
+                send_response(client_fd, -1, NULL, 0);
+                break;
+            }
+
+            /* Create shared memory for frame transfer.
+             * NV12 = w*h*1.5, P010 = w*h*3 */
+            uint32_t bpp = params.is10bit ? 2 : 1;
+            shm_size = params.width * bpp * params.height * 3 / 2;
+            shm_fd = memfd_create("nvenc-frame", MFD_CLOEXEC);
+            if (shm_fd < 0 || ftruncate(shm_fd, shm_size) < 0) {
+                HELPER_LOG("Failed to create shm: %s", strerror(errno));
+                if (shm_fd >= 0) { close(shm_fd); shm_fd = -1; }
+                /* Fall back to socket-based transfer (no shm) */
+                NVEncIPCInitResponse iresp = { .shm_size = 0 };
+                send_response_with_fd(client_fd, 0, -1, &iresp, sizeof(iresp));
+                break;
+            }
+
+            shm_ptr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+            if (shm_ptr == MAP_FAILED) {
+                HELPER_LOG("Failed to mmap shm: %s", strerror(errno));
+                close(shm_fd);
+                shm_fd = -1;
+                NVEncIPCInitResponse iresp = { .shm_size = 0 };
+                send_response_with_fd(client_fd, 0, -1, &iresp, sizeof(iresp));
+                break;
+            }
+
+            /* Send shm fd to client */
+            int client_shm_fd = dup(shm_fd); /* dup because SCM_RIGHTS transfers ownership */
+            NVEncIPCInitResponse iresp = { .shm_size = shm_size };
+            HELPER_LOG("Created shm: %u bytes, fd=%d", shm_size, client_shm_fd);
+            send_response_with_fd(client_fd, 0, client_shm_fd, &iresp, sizeof(iresp));
+            close(client_shm_fd);
             break;
         }
 
@@ -728,6 +811,40 @@ dmabuf_cleanup:
             break;
         }
 
+        case NVENC_IPC_CMD_ENCODE_SHM: {
+            if (!enc.initialized || shm_ptr == MAP_FAILED) {
+                /* Drain payload */
+                if (hdr.payload_size > 0) {
+                    void *tmp = malloc(hdr.payload_size);
+                    if (tmp) { recv_all(client_fd, tmp, hdr.payload_size); free(tmp); }
+                }
+                send_response(client_fd, -1, NULL, 0);
+                break;
+            }
+
+            NVEncIPCEncodeShmParams sp;
+            if (!recv_all(client_fd, &sp, sizeof(sp))) goto done;
+
+            cu->cuCtxPushCurrent(enc.cudaCtx);
+
+            /* Encode directly from shared memory — no socket data transfer */
+            void *bitstream = NULL;
+            uint32_t bsSize = 0;
+            bool ok = encoder_encode(&enc, shm_ptr, sp.width, sp.height,
+                                     sp.frame_size, sp.force_idr,
+                                     &bitstream, &bsSize);
+
+            cu->cuCtxPopCurrent(NULL);
+
+            if (ok) {
+                send_response(client_fd, 0, bitstream, bsSize);
+                free(bitstream);
+            } else {
+                send_response(client_fd, -1, NULL, 0);
+            }
+            break;
+        }
+
         case NVENC_IPC_CMD_CLOSE:
             encoder_close(&enc);
             send_response(client_fd, 0, NULL, 0);
@@ -745,6 +862,12 @@ done:
         cu->cuCtxPushCurrent(enc.cudaCtx);
         encoder_close(&enc);
         cu->cuCtxPopCurrent(NULL);
+    }
+    if (shm_ptr != MAP_FAILED) {
+        munmap(shm_ptr, shm_size);
+    }
+    if (shm_fd >= 0) {
+        close(shm_fd);
     }
     close(client_fd);
     HELPER_LOG("Client handler done");

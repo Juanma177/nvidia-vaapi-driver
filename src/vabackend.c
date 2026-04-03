@@ -14,6 +14,7 @@
 #include <malloc.h>
 #include <fcntl.h>
 #include <sys/param.h>
+#include <sys/mman.h>
 
 #include <va/va_backend.h>
 #include <va/va_drmcommon.h>
@@ -342,6 +343,10 @@ static bool destroyContext(NVDriver *drv, NVContext *nvCtx) {
         NVENCContext *nvencCtx = (NVENCContext*) nvCtx->encodeData;
         if (nvencCtx != NULL) {
             if (nvencCtx->useIPC) {
+                if (nvencCtx->shmPtr != NULL) {
+                    munmap(nvencCtx->shmPtr, nvencCtx->shmSize);
+                    nvencCtx->shmPtr = NULL;
+                }
                 if (nvencCtx->ipcFd >= 0) {
                     nvenc_ipc_close(nvencCtx->ipcFd);
                     nvencCtx->ipcFd = -1;
@@ -1291,6 +1296,9 @@ static VAStatus nvCreateContext(
         nvencCtx->frameRateNum = 30;
         nvencCtx->frameRateDen = 1;
         nvencCtx->ipcFd = -1;
+        nvencCtx->shmPtr = NULL;
+        nvencCtx->shmSize = 0;
+        nvencCtx->shmFd = -1;
 
         if (drv->cudaAvailable) {
             /* Direct NVENC path (64-bit, CUDA works) */
@@ -2065,12 +2073,31 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
             .is10bit = (nvencCtx->inputFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? 1 : 0,
         };
 
-        if (nvenc_ipc_init(nvencCtx->ipcFd, &params) != 0) {
+        int shm_fd = -1;
+        uint32_t shm_size = 0;
+        if (nvenc_ipc_init(nvencCtx->ipcFd, &params, &shm_fd, &shm_size) != 0) {
             LOG("IPC encode: init failed");
             return VA_STATUS_ERROR_OPERATION_FAILED;
         }
         nvencCtx->initialized = true;
-        LOG("IPC encode: encoder initialized %ux%u", params.width, params.height);
+
+        /* Map shared memory if the helper provided one */
+        if (shm_fd >= 0 && shm_size > 0) {
+            nvencCtx->shmPtr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE,
+                                     MAP_SHARED, shm_fd, 0);
+            if (nvencCtx->shmPtr == MAP_FAILED) {
+                nvencCtx->shmPtr = NULL;
+                LOG("IPC encode: shm mmap failed, falling back to socket");
+            } else {
+                nvencCtx->shmSize = shm_size;
+                nvencCtx->shmFd = shm_fd;
+                LOG("IPC encode: shm enabled, %u bytes", shm_size);
+            }
+            close(shm_fd); /* mmap keeps the mapping alive after close */
+        }
+
+        LOG("IPC encode: encoder initialized %ux%u shm=%s",
+            params.width, params.height, nvencCtx->shmPtr ? "yes" : "no");
     }
 
     /* Encode via IPC.
@@ -2115,28 +2142,38 @@ static VAStatus nvEndPictureEncodeIPC(NVDriver *drv, NVContext *nvCtx)
     if (useHostData) {
         /* Host memory path: pixel data from vaDeriveImage/vaPutImage.
          * IMPORTANT: use the SURFACE dimensions (e.g. 1920x1080), not the
-         * encoder dimensions (e.g. 1920x1088). The surface has exactly
-         * width*height*1.5 bytes of NV12 data. The encoder may be configured
-         * for a larger MB-aligned height — the helper pads the extra lines. */
+         * encoder dimensions (e.g. 1920x1088). */
         uint32_t surfW = surface->width;
         uint32_t surfH = surface->height;
         uint32_t frameSize = surface->hostPixelSize;
-        void *snapshot = malloc(frameSize);
-        if (snapshot == NULL) {
-            return VA_STATUS_ERROR_ALLOCATION_FAILED;
-        }
-        memcpy(snapshot, surface->hostPixelData, frameSize);
-
-        if (nvencCtx->frameCount < 3) {
-            LOG("IPC encode: HOST path surface=%ux%u encoder=%ux%u %u bytes",
-                surfW, surfH, nvencCtx->width, nvencCtx->height, frameSize);
-        }
-        ret = nvenc_ipc_encode(nvencCtx->ipcFd, snapshot,
-                                surfW, surfH, frameSize,
-                                nvencCtx->forceIDR ? 1 : 0,
-                                &bitstream, &bsSize);
-        free(snapshot);
+        uint32_t forceIDR = nvencCtx->forceIDR ? 1 : 0;
         nvencCtx->forceIDR = false;
+
+        if (nvencCtx->shmPtr != NULL && frameSize <= nvencCtx->shmSize) {
+            /* SHM path: copy frame to shared memory, send small signal only.
+             * Saves ~6ms by avoiding 3MB socket send+recv. */
+            memcpy(nvencCtx->shmPtr, surface->hostPixelData, frameSize);
+            if (nvencCtx->frameCount < 3) {
+                LOG("IPC encode: SHM path %ux%u %u bytes", surfW, surfH, frameSize);
+            }
+            ret = nvenc_ipc_encode_shm(nvencCtx->ipcFd, surfW, surfH,
+                                        frameSize, forceIDR,
+                                        &bitstream, &bsSize);
+        } else {
+            /* Socket fallback: snapshot + full send */
+            void *snapshot = malloc(frameSize);
+            if (snapshot == NULL) {
+                return VA_STATUS_ERROR_ALLOCATION_FAILED;
+            }
+            memcpy(snapshot, surface->hostPixelData, frameSize);
+            if (nvencCtx->frameCount < 3) {
+                LOG("IPC encode: SOCKET path %ux%u %u bytes", surfW, surfH, frameSize);
+            }
+            ret = nvenc_ipc_encode(nvencCtx->ipcFd, snapshot,
+                                    surfW, surfH, frameSize, forceIDR,
+                                    &bitstream, &bsSize);
+            free(snapshot);
+        }
     } else if (useDmaBuf) {
         if (nvencCtx->frameCount < 3) {
             LOG("IPC encode: DMABUF planes=%d fds=[%d,%d] %ux%u pitch=%u sizes=[%u,%u]",

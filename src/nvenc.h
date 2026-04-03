@@ -64,6 +64,10 @@ typedef struct {
     /* IPC mode: encode via 64-bit helper when CUDA is unavailable */
     bool                            useIPC;
     int                             ipcFd;   /* socket to nvenc-helper, -1 if not connected */
+    /* Shared memory for zero-copy frame transfer */
+    void                           *shmPtr;  /* mmap'd shared memory, NULL if not available */
+    uint32_t                        shmSize; /* size of shm region */
+    int                             shmFd;   /* shm file descriptor, -1 if not available */
 } NVENCContext;
 
 /*

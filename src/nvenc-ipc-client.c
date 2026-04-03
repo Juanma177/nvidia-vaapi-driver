@@ -132,7 +132,37 @@ int nvenc_ipc_connect_or_start(const char *helper_path)
     return -1;
 }
 
-int nvenc_ipc_init(int fd, const NVEncIPCInitParams *params)
+/* Receive a single fd via SCM_RIGHTS */
+static int recv_fd(int sock, void *buf, size_t len)
+{
+    struct iovec iov = { .iov_base = buf, .iov_len = len };
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } cmsg_buf;
+    memset(&cmsg_buf, 0, sizeof(cmsg_buf));
+
+    struct msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = cmsg_buf.buf,
+        .msg_controllen = sizeof(cmsg_buf.buf),
+    };
+
+    ssize_t n = recvmsg(sock, &msg, 0);
+    if (n != (ssize_t)len) return -1;
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+        int received_fd = -1;
+        memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
+        return received_fd;
+    }
+    return -1;
+}
+
+int nvenc_ipc_init(int fd, const NVEncIPCInitParams *params,
+                   int *shm_fd_out, uint32_t *shm_size_out)
 {
     NVEncIPCMsgHeader hdr = {
         .cmd = NVENC_IPC_CMD_INIT,
@@ -142,10 +172,28 @@ int nvenc_ipc_init(int fd, const NVEncIPCInitParams *params)
     if (!send_all(fd, &hdr, sizeof(hdr))) return -1;
     if (!send_all(fd, params, sizeof(*params))) return -1;
 
+    /* Response includes shm fd via SCM_RIGHTS + NVEncIPCInitResponse payload */
     NVEncIPCRespHeader resp;
-    if (!recv_all(fd, &resp, sizeof(resp))) return -1;
+    NVEncIPCInitResponse init_resp = {0};
 
-    return resp.status;
+    int shm_fd = recv_fd(fd, &resp, sizeof(resp));
+
+    if (resp.status != 0) {
+        if (shm_fd >= 0) close(shm_fd);
+        return resp.status;
+    }
+
+    if (resp.payload_size >= sizeof(init_resp)) {
+        if (!recv_all(fd, &init_resp, sizeof(init_resp))) {
+            if (shm_fd >= 0) close(shm_fd);
+            return -1;
+        }
+    }
+
+    if (shm_fd_out) *shm_fd_out = shm_fd;
+    if (shm_size_out) *shm_size_out = init_resp.shm_size;
+
+    return 0;
 }
 
 int nvenc_ipc_encode(int fd, const void *frame_data,
@@ -239,6 +287,52 @@ int nvenc_ipc_encode_dmabuf(int fd, const int *dmabuf_fds, int num_fds,
     if (!send_fds(fd, dmabuf_fds, num_fds, params, sizeof(*params))) return -1;
 
     /* Receive response */
+    NVEncIPCRespHeader resp;
+    if (!recv_all(fd, &resp, sizeof(resp))) return -1;
+
+    if (resp.status != 0) {
+        *bitstream_out = NULL;
+        *bitstream_size_out = 0;
+        return resp.status;
+    }
+
+    if (resp.payload_size > 0) {
+        void *data = malloc(resp.payload_size);
+        if (data == NULL) return -1;
+        if (!recv_all(fd, data, resp.payload_size)) {
+            free(data);
+            return -1;
+        }
+        *bitstream_out = data;
+        *bitstream_size_out = resp.payload_size;
+    } else {
+        *bitstream_out = NULL;
+        *bitstream_size_out = 0;
+    }
+
+    return 0;
+}
+
+int nvenc_ipc_encode_shm(int fd, uint32_t width, uint32_t height,
+                         uint32_t frame_size, uint32_t force_idr,
+                         void **bitstream_out, uint32_t *bitstream_size_out)
+{
+    NVEncIPCEncodeShmParams sp = {
+        .width = width,
+        .height = height,
+        .frame_size = frame_size,
+        .force_idr = force_idr,
+    };
+
+    NVEncIPCMsgHeader hdr = {
+        .cmd = NVENC_IPC_CMD_ENCODE_SHM,
+        .payload_size = sizeof(sp)
+    };
+
+    /* Only send the small header + params — pixel data is already in shm */
+    if (!send_all(fd, &hdr, sizeof(hdr))) return -1;
+    if (!send_all(fd, &sp, sizeof(sp))) return -1;
+
     NVEncIPCRespHeader resp;
     if (!recv_all(fd, &resp, sizeof(resp))) return -1;
 

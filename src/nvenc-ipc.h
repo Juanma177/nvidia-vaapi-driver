@@ -25,6 +25,7 @@
 #define NVENC_IPC_CMD_ENCODE  2  /* Encode a frame (host pixel data) */
 #define NVENC_IPC_CMD_CLOSE   3  /* Close encoder and disconnect */
 #define NVENC_IPC_CMD_ENCODE_DMABUF 4  /* Encode from DMA-BUF fd (GPU zero-copy) */
+#define NVENC_IPC_CMD_ENCODE_SHM   5  /* Encode from shared memory (zero-copy host) */
 
 /* Message header (client → helper) */
 typedef struct {
@@ -74,6 +75,20 @@ typedef struct {
     uint32_t is10bit;
 } NVEncIPCEncodeDmaBufParams;
 
+/* CMD_INIT response includes a shm fd via SCM_RIGHTS.
+ * The shm region is large enough for one NV12/P010 frame. */
+typedef struct {
+    uint32_t shm_size;          /* size of the shared memory region */
+} NVEncIPCInitResponse;
+
+/* CMD_ENCODE_SHM payload (frame data is already in shared memory) */
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t frame_size;
+    uint32_t force_idr;
+} NVEncIPCEncodeShmParams;
+
 /* IPC client functions (used by the 32-bit driver) */
 
 /* Get the socket path for this user */
@@ -85,8 +100,11 @@ int nvenc_ipc_connect(void);
 /* Start the helper if not running, then connect. Returns socket fd or -1. */
 int nvenc_ipc_connect_or_start(const char *helper_path);
 
-/* Send init command. Returns 0 on success. */
-int nvenc_ipc_init(int fd, const NVEncIPCInitParams *params);
+/* Send init command. Returns 0 on success.
+ * If shm_fd_out is non-NULL, receives the shared memory fd from the helper.
+ * If shm_size_out is non-NULL, receives the shm region size. */
+int nvenc_ipc_init(int fd, const NVEncIPCInitParams *params,
+                   int *shm_fd_out, uint32_t *shm_size_out);
 
 /* Send frame data and receive encoded bitstream.
  * bitstream_out is malloc'd by this function, caller must free.
@@ -103,6 +121,13 @@ int nvenc_ipc_encode(int fd, const void *frame_data,
 int nvenc_ipc_encode_dmabuf(int fd, const int *dmabuf_fds, int num_fds,
                             const NVEncIPCEncodeDmaBufParams *params,
                             void **bitstream_out, uint32_t *bitstream_size_out);
+
+/* Encode from shared memory — frame data already written to shm.
+ * Only sends a small header, no pixel data over the socket.
+ * Returns 0 on success. */
+int nvenc_ipc_encode_shm(int fd, uint32_t width, uint32_t height,
+                         uint32_t frame_size, uint32_t force_idr,
+                         void **bitstream_out, uint32_t *bitstream_size_out);
 
 /* Send close command and close the socket. */
 void nvenc_ipc_close(int fd);
