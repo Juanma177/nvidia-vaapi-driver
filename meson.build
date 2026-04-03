@@ -105,6 +105,23 @@ if host_machine.cpu_family() == 'x86_64' or host_machine.cpu_family() == 'aarch6
     )
 endif
 
+# Tests (native builds only, not cross-compiled)
+if not meson.is_cross_build()
+    libva_test_deps = [
+        dependency('libva'),
+        dependency('libva-drm'),
+        cc.find_library('m', required : false),
+    ]
+
+    test_encode = executable('test_encode', 'tests/test_encode.c',
+        dependencies : libva_test_deps, install : false)
+    test('encode', test_encode, timeout : 60)
+
+    test_encode_config = executable('test_encode_config', 'tests/test_encode_config.c',
+        dependencies : libva_test_deps, install : false)
+    test('encode_config', test_encode_config, timeout : 60)
+endif
+
 meson.add_devenv(environment({
     'NVD_LOG': '1',
     'LIBVA_DRIVER_NAME': 'nvidia',
