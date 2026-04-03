@@ -4,7 +4,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* Helper to check NVENC return status */
 static bool check_nvenc_status(NVENCSTATUS status, const char *func, int line)
 {
     if (status != NV_ENC_SUCCESS) {
@@ -23,10 +22,7 @@ bool nvenc_load(NvencFunctions **nvenc_dl)
         *nvenc_dl = NULL;
         return false;
     }
-    /* Verify NVENC API version compatibility.
-     * NvEncodeAPIGetMaxSupportedVersion returns version as (major << 4 | minor).
-     * NVENCAPI_VERSION uses a different format (major | minor << 24).
-     * Compare using the API's format. */
+    //version format: API returns (major << 4 | minor)
     uint32_t maxVersion = 0;
     NVENCSTATUS st = (*nvenc_dl)->NvEncodeAPIGetMaxSupportedVersion(&maxVersion);
     if (st != NV_ENC_SUCCESS) {
@@ -125,7 +121,7 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
     nvencCtx->width = width;
     nvencCtx->height = height;
 
-    /* Get preset config as starting point */
+    //get preset config
     NV_ENC_PRESET_CONFIG presetConfig = {0};
     presetConfig.version = NV_ENC_PRESET_CONFIG_VER;
     presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
@@ -136,12 +132,11 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
         return false;
     }
 
-    /* Copy preset config and apply our overrides */
+    //apply overrides
     memcpy(&nvencCtx->encodeConfig, &presetConfig.presetCfg, sizeof(NV_ENC_CONFIG));
     nvencCtx->encodeConfig.version = NV_ENC_CONFIG_VER;
     nvencCtx->encodeConfig.profileGUID = profileGuid;
 
-    /* Apply rate control settings if set by VA-API caller */
     if (nvencCtx->rcMode != 0) {
         nvencCtx->encodeConfig.rcParams.rateControlMode = (NV_ENC_PARAMS_RC_MODE)nvencCtx->rcMode;
     }
@@ -152,29 +147,12 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
         nvencCtx->encodeConfig.rcParams.maxBitRate = nvencCtx->maxBitrate;
     }
 
-    /* Apply GOP settings if set */
     if (nvencCtx->intraPeriod > 0) {
         nvencCtx->encodeConfig.gopLength = nvencCtx->intraPeriod;
     }
-    /*
-     * B-frames are disabled (frameIntervalP=1).
-     *
-     * NVENC with enablePTD=0 and B-frames requires full DPB (Decoded Picture
-     * Buffer) reference frame management from the caller — specifying which
-     * frames are references, managing the reference picture list, and setting
-     * up the codec-specific reference frame structures. This is what Intel's
-     * VA-API driver does internally with its hardware encoder.
-     *
-     * With enablePTD=1, NVENC handles references internally but returns
-     * NV_ENC_ERR_NEED_MORE_INPUT for B-frames, which ffmpeg 6.x vaapi_encode
-     * doesn't support (asserts on empty coded buffers).
-     *
-     * No B-frames is optimal for the primary use case (low-latency streaming).
-     * For offline encoding with B-frames, use h264_nvenc/hevc_nvenc directly.
-     */
+    //no B-frames: NVENC needs DPB management or returns NEED_MORE_INPUT which ffmpeg 6.x can't handle
     nvencCtx->encodeConfig.frameIntervalP = 1;
 
-    /* Initialize encoder */
     memset(&nvencCtx->initParams, 0, sizeof(nvencCtx->initParams));
     nvencCtx->initParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
     nvencCtx->initParams.encodeGUID = codecGuid;
@@ -185,7 +163,7 @@ bool nvenc_init_encoder(NVENCContext *nvencCtx, uint32_t width, uint32_t height,
     nvencCtx->initParams.darHeight = height;
     nvencCtx->initParams.frameRateNum = nvencCtx->frameRateNum > 0 ? nvencCtx->frameRateNum : 30;
     nvencCtx->initParams.frameRateDen = nvencCtx->frameRateDen > 0 ? nvencCtx->frameRateDen : 1;
-    nvencCtx->initParams.enablePTD = 1; /* Let NVENC decide picture types */
+    nvencCtx->initParams.enablePTD = 1;
     nvencCtx->initParams.encodeConfig = &nvencCtx->encodeConfig;
     nvencCtx->initParams.maxEncodeWidth = width;
     nvencCtx->initParams.maxEncodeHeight = height;

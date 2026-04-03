@@ -1,18 +1,12 @@
 #include "vabackend.h"
 #include "nvenc.h"
-#include "encode_handlers.h"
-
 #include <string.h>
 #include <va/va.h>
 
-/*
- * HEVC VA-API encode buffer handlers.
- */
-
-void hevcenc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer)
+void hevcenc_handle_sequence_params(NVENCContext *nvencCtx, void *buffer_ptr)
 {
     VAEncSequenceParameterBufferHEVC *seq =
-        (VAEncSequenceParameterBufferHEVC*) buffer->ptr;
+        (VAEncSequenceParameterBufferHEVC*) ((NVBuffer*)buffer_ptr)->ptr;
 
     LOG("HEVC encode: seq params %ux%u, intra_period=%u, ip_period=%u",
         seq->pic_width_in_luma_samples, seq->pic_height_in_luma_samples,
@@ -45,10 +39,10 @@ void hevcenc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     nvencCtx->seqParamSet = true;
 }
 
-void hevcenc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
+void hevcenc_handle_picture_params(NVENCContext *nvencCtx, void *buffer_ptr)
 {
     VAEncPictureParameterBufferHEVC *pic =
-        (VAEncPictureParameterBufferHEVC*) buffer->ptr;
+        (VAEncPictureParameterBufferHEVC*) ((NVBuffer*)buffer_ptr)->ptr;
 
     nvencCtx->currentCodedBufId = pic->coded_buf;
     nvencCtx->forceIDR = (pic->pic_fields.bits.idr_pic_flag != 0);
@@ -57,10 +51,10 @@ void hevcenc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     }
 }
 
-void hevcenc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)
+void hevcenc_handle_slice_params(NVENCContext *nvencCtx, void *buffer_ptr)
 {
     VAEncSliceParameterBufferHEVC *slice =
-        (VAEncSliceParameterBufferHEVC*) buffer->ptr;
+        (VAEncSliceParameterBufferHEVC*) ((NVBuffer*)buffer_ptr)->ptr;
 
     /* Map VA-API HEVC slice_type to NVENC picture type.
      * HEVC slice types: 0=B, 1=P, 2=I */
@@ -81,9 +75,9 @@ void hevcenc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     }
 }
 
-void hevcenc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
+void hevcenc_handle_misc_params(NVENCContext *nvencCtx, void *buffer_ptr)
 {
-    VAEncMiscParameterBuffer *misc = (VAEncMiscParameterBuffer*) buffer->ptr;
+    VAEncMiscParameterBuffer *misc = (VAEncMiscParameterBuffer*) ((NVBuffer*)buffer_ptr)->ptr;
 
     switch (misc->type) {
     case VAEncMiscParameterTypeRateControl: {

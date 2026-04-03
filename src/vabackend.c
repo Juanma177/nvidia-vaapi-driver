@@ -4,7 +4,7 @@
 #include "backend-common.h"
 #include "nvenc.h"
 #include "nvenc-ipc.h"
-#include "encode_handlers.h"
+
 
 #include <assert.h>
 #include <stdio.h>

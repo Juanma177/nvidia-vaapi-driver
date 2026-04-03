@@ -7,75 +7,45 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/*
- * Encode-specific context, stored in NVContext->encodeData when
- * the context is created with VAEntrypointEncSlice.
- */
-
 typedef struct {
     NV_ENC_OUTPUT_PTR       bitstreamBuffer;
     bool                    allocated;
-    /* Locked state tracking */
     void                   *lockedPtr;
     uint32_t                lockedSize;
     bool                    locked;
 } NVENCOutputBuffer;
 
 typedef struct {
-    /* NVENC encoder session handle */
     void                           *encoder;
-    /* NVENC API function list */
     NV_ENCODE_API_FUNCTION_LIST     funcs;
-    /* Encoder initialized flag */
     bool                            initialized;
-    /* Codec GUID (H264 or HEVC) */
     GUID                            codecGuid;
-    /* Profile GUID */
     GUID                            profileGuid;
-    /* Encode configuration (from preset + overrides) */
     NV_ENC_CONFIG                   encodeConfig;
     NV_ENC_INITIALIZE_PARAMS        initParams;
-    /* Frame dimensions */
     uint32_t                        width;
     uint32_t                        height;
-    /* Buffer format for input surfaces */
     NV_ENC_BUFFER_FORMAT            inputFormat;
-    /* Sequence-level params received from VA-API */
     bool                            seqParamSet;
-    /* Rate control mode requested via VA-API */
     uint32_t                        rcMode;
-    /* Bitrate in bits/sec */
     uint32_t                        bitrate;
     uint32_t                        maxBitrate;
-    /* Framerate */
     uint32_t                        frameRateNum;
     uint32_t                        frameRateDen;
-    /* Intra period / GOP */
     uint32_t                        intraPeriod;
     uint32_t                        ipPeriod;
-    /* Frame counter */
     uint64_t                        frameCount;
-    /* Output bitstream buffer for the current encode */
     NVENCOutputBuffer               outputBuffer;
-    /* Current coded buffer ID from VAEncPictureParameterBuffer */
     VABufferID                      currentCodedBufId;
-    /* Force IDR on next frame (set by picture params idr_pic_flag) */
     bool                            forceIDR;
-    /* Picture type from VA-API slice params (used when enablePTD=0) */
     NV_ENC_PIC_TYPE                 picType;
-    /* IPC mode: encode via 64-bit helper when CUDA is unavailable */
     bool                            useIPC;
-    int                             ipcFd;   /* socket to nvenc-helper, -1 if not connected */
-    /* Shared memory for zero-copy frame transfer */
-    void                           *shmPtr;  /* mmap'd shared memory, NULL if not available */
-    uint32_t                        shmSize; /* size of shm region */
-    int                             shmFd;   /* shm file descriptor, -1 if not available */
+    int                             ipcFd;
+    void                           *shmPtr;
+    uint32_t                        shmSize;
+    int                             shmFd;
 } NVENCContext;
 
-/*
- * Coded buffer structure used for VAEncCodedBufferType.
- * This wraps the VA-API coded buffer segment with NVENC bitstream data.
- */
 typedef struct {
     VACodedBufferSegment    segment;
     void                   *bitstreamData;
@@ -84,7 +54,6 @@ typedef struct {
     bool                    hasData;
 } NVCodedBuffer;
 
-/* NVENC helper functions */
 bool nvenc_load(NvencFunctions **nvenc_dl);
 void nvenc_unload(NvencFunctions **nvenc_dl);
 
@@ -107,7 +76,6 @@ bool nvenc_map_resource(NVENCContext *nvencCtx, NV_ENC_REGISTERED_PTR registered
 bool nvenc_unmap_resource(NVENCContext *nvencCtx, NV_ENC_INPUT_PTR mapped);
 bool nvenc_unregister_resource(NVENCContext *nvencCtx, NV_ENC_REGISTERED_PTR registered);
 
-/* Returns: 1=output ready, 0=needs more input (B-frames), -1=error */
 int nvenc_encode_frame(NVENCContext *nvencCtx, NV_ENC_INPUT_PTR inputBuffer,
                        NV_ENC_BUFFER_FORMAT bufferFmt,
                        uint32_t inputWidth, uint32_t inputHeight, uint32_t inputPitch,
@@ -116,10 +84,20 @@ int nvenc_encode_frame(NVENCContext *nvencCtx, NV_ENC_INPUT_PTR inputBuffer,
 bool nvenc_lock_bitstream(NVENCContext *nvencCtx, void **outPtr, uint32_t *outSize);
 bool nvenc_unlock_bitstream(NVENCContext *nvencCtx);
 
-/* Profile/entrypoint query helpers */
 bool nvenc_is_encode_profile(VAProfile profile);
 GUID nvenc_va_profile_to_codec_guid(VAProfile profile);
 GUID nvenc_va_profile_to_profile_guid(VAProfile profile);
 NV_ENC_BUFFER_FORMAT nvenc_surface_format(VAProfile profile);
 
-#endif /* NVENC_H */
+/* Encode buffer handlers — NVBuffer defined in vabackend.h.
+ * Using void* to avoid circular include dependency. */
+void h264enc_handle_sequence_params(NVENCContext *ctx, void *buf);
+void h264enc_handle_picture_params(NVENCContext *ctx, void *buf);
+void h264enc_handle_slice_params(NVENCContext *ctx, void *buf);
+void h264enc_handle_misc_params(NVENCContext *ctx, void *buf);
+void hevcenc_handle_sequence_params(NVENCContext *ctx, void *buf);
+void hevcenc_handle_picture_params(NVENCContext *ctx, void *buf);
+void hevcenc_handle_slice_params(NVENCContext *ctx, void *buf);
+void hevcenc_handle_misc_params(NVENCContext *ctx, void *buf);
+
+#endif // NVENC_H

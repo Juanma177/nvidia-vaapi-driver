@@ -1,20 +1,12 @@
 #include "vabackend.h"
 #include "nvenc.h"
-#include "encode_handlers.h"
-
 #include <string.h>
 #include <va/va.h>
 
-/*
- * H.264 VA-API encode buffer handlers.
- * These are called from nvRenderPicture when the context is an encode context.
- * They accumulate parameters from the application and set them on the NVENCContext.
- */
-
-void h264enc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer)
+void h264enc_handle_sequence_params(NVENCContext *nvencCtx, void *buffer_ptr)
 {
     VAEncSequenceParameterBufferH264 *seq =
-        (VAEncSequenceParameterBufferH264*) buffer->ptr;
+        (VAEncSequenceParameterBufferH264*) ((NVBuffer*)buffer_ptr)->ptr;
 
     LOG("H264 encode: seq params %ux%u, intra_period=%u, ip_period=%u",
         seq->picture_width_in_mbs * 16, seq->picture_height_in_mbs * 16,
@@ -48,10 +40,10 @@ void h264enc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     nvencCtx->seqParamSet = true;
 }
 
-void h264enc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
+void h264enc_handle_picture_params(NVENCContext *nvencCtx, void *buffer_ptr)
 {
     VAEncPictureParameterBufferH264 *pic =
-        (VAEncPictureParameterBufferH264*) buffer->ptr;
+        (VAEncPictureParameterBufferH264*) ((NVBuffer*)buffer_ptr)->ptr;
 
     /* Only log first few frames to avoid flooding at 60fps */
     if (nvencCtx->frameCount < 3) {
@@ -66,10 +58,10 @@ void h264enc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     }
 }
 
-void h264enc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)
+void h264enc_handle_slice_params(NVENCContext *nvencCtx, void *buffer_ptr)
 {
     VAEncSliceParameterBufferH264 *slice =
-        (VAEncSliceParameterBufferH264*) buffer->ptr;
+        (VAEncSliceParameterBufferH264*) ((NVBuffer*)buffer_ptr)->ptr;
 
     /* Map VA-API H.264 slice_type to NVENC picture type.
      * Currently unused (enablePTD=1), but kept for future B-frame support. */
@@ -90,9 +82,9 @@ void h264enc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     }
 }
 
-void h264enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
+void h264enc_handle_misc_params(NVENCContext *nvencCtx, void *buffer_ptr)
 {
-    VAEncMiscParameterBuffer *misc = (VAEncMiscParameterBuffer*) buffer->ptr;
+    VAEncMiscParameterBuffer *misc = (VAEncMiscParameterBuffer*) ((NVBuffer*)buffer_ptr)->ptr;
 
     switch (misc->type) {
     case VAEncMiscParameterTypeRateControl: {
