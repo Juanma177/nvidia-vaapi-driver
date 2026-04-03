@@ -69,8 +69,14 @@ typedef struct {
     void                       *encoder;
     NV_ENCODE_API_FUNCTION_LIST funcs;
     bool                        initialized;
-    NV_ENC_INPUT_PTR            inputBuffer;
+    NV_ENC_INPUT_PTR            inputBuffer;   /* NVENC-managed (fallback) */
     NV_ENC_OUTPUT_PTR           outputBuffer;
+    /* Persistent CUDA buffer for GPU-side encode (avoids nvEncLockInputBuffer) */
+    CUdeviceptr                 gpuBuf;        /* Linear CUDA VRAM buffer */
+    uint32_t                    gpuBufPitch;   /* Aligned pitch */
+    uint32_t                    gpuBufSize;    /* Total allocation size */
+    NV_ENC_REGISTERED_PTR       gpuBufReg;     /* Persistent NVENC registration */
+    bool                        gpuBufReady;   /* true if GPU path available */
     uint32_t                    width;
     uint32_t                    height;
     uint32_t                    is10bit;
@@ -283,10 +289,52 @@ static bool encoder_init(HelperEncoder *enc, const NVEncIPCInitParams *params)
     enc->frameCount = 0;
     enc->initialized = true;
 
-    HELPER_LOG("Encoder initialized: %ux%u %s %s",
+    /* Allocate persistent CUDA linear buffer for GPU-side encode.
+     * This replaces nvEncLockInputBuffer (host memory) with a CUDA device
+     * buffer registered once with NVENC. Per-frame: single cuMemcpy2D
+     * (host→device with pitch conversion) + nvEncMapInputResource. */
+    uint32_t bpp = params->is10bit ? 2 : 1;
+    enc->gpuBufPitch = params->width * bpp;
+    enc->gpuBufPitch = (enc->gpuBufPitch + 255) & ~255; /* Align to 256 */
+    enc->gpuBufSize = enc->gpuBufPitch * params->height * 3 / 2;
+    enc->gpuBufReady = false;
+
+    CUresult cres = cu->cuMemAlloc(&enc->gpuBuf, enc->gpuBufSize);
+    if (cres == CUDA_SUCCESS) {
+        NV_ENC_BUFFER_FORMAT bufFmt = params->is10bit
+            ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT : NV_ENC_BUFFER_FORMAT_NV12;
+
+        NV_ENC_REGISTER_RESOURCE regRes = {0};
+        regRes.version = NV_ENC_REGISTER_RESOURCE_VER;
+        regRes.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
+        regRes.resourceToRegister = (void *)enc->gpuBuf;
+        regRes.width = params->width;
+        regRes.height = params->height;
+        regRes.pitch = enc->gpuBufPitch;
+        regRes.bufferFormat = bufFmt;
+        regRes.bufferUsage = NV_ENC_INPUT_IMAGE;
+
+        st = enc->funcs.nvEncRegisterResource(enc->encoder, &regRes);
+        if (st == NV_ENC_SUCCESS) {
+            enc->gpuBufReg = regRes.registeredResource;
+            enc->gpuBufReady = true;
+            HELPER_LOG("GPU buffer: %u bytes, pitch=%u (persistent CUDA+NVENC)",
+                       enc->gpuBufSize, enc->gpuBufPitch);
+        } else {
+            HELPER_LOG("GPU buffer register failed (%d), falling back to host path", st);
+            cu->cuMemFree(enc->gpuBuf);
+            enc->gpuBuf = 0;
+        }
+    } else {
+        HELPER_LOG("GPU buffer alloc failed (%d), falling back to host path", cres);
+        enc->gpuBuf = 0;
+    }
+
+    HELPER_LOG("Encoder initialized: %ux%u %s %s (gpu=%s)",
                params->width, params->height,
                params->codec == 0 ? "H.264" : "HEVC",
-               params->is10bit ? "10-bit" : "8-bit");
+               params->is10bit ? "10-bit" : "8-bit",
+               enc->gpuBufReady ? "yes" : "no");
     return true;
 
 fail:
@@ -303,70 +351,136 @@ static bool encoder_encode(HelperEncoder *enc, const void *frame_data,
                            void **out_data, uint32_t *out_size)
 {
     NVENCSTATUS st;
-
-    /* Lock input buffer and copy frame data in */
-    NV_ENC_LOCK_INPUT_BUFFER lockIn = {0};
-    lockIn.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-    lockIn.inputBuffer = enc->inputBuffer;
-
-    st = enc->funcs.nvEncLockInputBuffer(enc->encoder, &lockIn);
-    if (st != NV_ENC_SUCCESS) {
-        HELPER_LOG("nvEncLockInputBuffer failed: %d", st);
-        return false;
-    }
-
-    /* Copy NV12/P010 data into NVENC's buffer, respecting pitch.
-     * frame_height may be smaller than enc->height (e.g. 1080 vs 1088)
-     * because the encoder uses MB-aligned height. */
     uint32_t bpp = enc->is10bit ? 2 : 1;
     uint32_t srcPitch = frame_width * bpp;
-    uint32_t dstPitch = lockIn.pitch;
-    uint8_t *src = (uint8_t *)frame_data;
-    uint8_t *dst = (uint8_t *)lockIn.bufferDataPtr;
-    uint32_t chromaOffset_src = srcPitch * frame_height;
-    uint32_t chromaOffset_dst = dstPitch * enc->height;
-    uint32_t chromaHeight = frame_height / 2;
-    uint32_t padLines = enc->height - frame_height;
+    NV_ENC_INPUT_PTR encodeInput;
+    NV_ENC_BUFFER_FORMAT encFmt = enc->is10bit
+        ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT : NV_ENC_BUFFER_FORMAT_NV12;
+    uint32_t encodePitch;
+    bool usedGpuPath = false;
 
-    /* Fast path: if pitches match, use bulk memcpy instead of line-by-line */
-    if (srcPitch == dstPitch) {
-        memcpy(dst, src, srcPitch * frame_height);
-        memcpy(dst + chromaOffset_dst, src + chromaOffset_src, srcPitch * chromaHeight);
-    } else {
-        /* Pitch mismatch: line-by-line copy */
-        for (uint32_t y = 0; y < frame_height; y++) {
-            memcpy(dst + y * dstPitch, src + y * srcPitch, srcPitch);
+    if (enc->gpuBufReady) {
+        /* GPU FAST PATH: cuMemcpy2D host→device with pitch conversion.
+         * Single CUDA call replaces 1080+ individual memcpy calls.
+         * GPU DMA engine handles pitch conversion in hardware.
+         * NVENC reads from VRAM — no PCIe upload at encode time. */
+        uint32_t padLines = enc->height - frame_height;
+
+        /* Luma: host SHM → GPU buffer */
+        CUDA_MEMCPY2D cpyLuma = {0};
+        cpyLuma.srcMemoryType = CU_MEMORYTYPE_HOST;
+        cpyLuma.srcHost = frame_data;
+        cpyLuma.srcPitch = srcPitch;
+        cpyLuma.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+        cpyLuma.dstDevice = enc->gpuBuf;
+        cpyLuma.dstPitch = enc->gpuBufPitch;
+        cpyLuma.WidthInBytes = srcPitch;
+        cpyLuma.Height = frame_height;
+
+        CUresult cres = cu->cuMemcpy2D(&cpyLuma);
+        if (cres != CUDA_SUCCESS) {
+            HELPER_LOG("GPU path: luma cuMemcpy2D failed: %d, falling back", cres);
+            goto host_fallback;
         }
-        for (uint32_t y = 0; y < chromaHeight; y++) {
-            memcpy(dst + chromaOffset_dst + y * dstPitch,
-                   src + chromaOffset_src + y * srcPitch,
-                   srcPitch);
+
+        /* Chroma: host SHM → GPU buffer */
+        uint32_t chromaOff_src = srcPitch * frame_height;
+        uint32_t chromaOff_dst = enc->gpuBufPitch * enc->height;
+        uint32_t chromaHeight = frame_height / 2;
+
+        CUDA_MEMCPY2D cpyChroma = {0};
+        cpyChroma.srcMemoryType = CU_MEMORYTYPE_HOST;
+        cpyChroma.srcHost = (const uint8_t *)frame_data + chromaOff_src;
+        cpyChroma.srcPitch = srcPitch;
+        cpyChroma.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+        cpyChroma.dstDevice = enc->gpuBuf + chromaOff_dst;
+        cpyChroma.dstPitch = enc->gpuBufPitch;
+        cpyChroma.WidthInBytes = srcPitch;
+        cpyChroma.Height = chromaHeight;
+
+        cres = cu->cuMemcpy2D(&cpyChroma);
+        if (cres != CUDA_SUCCESS) {
+            HELPER_LOG("GPU path: chroma cuMemcpy2D failed: %d, falling back", cres);
+            goto host_fallback;
         }
+
+        /* Zero padding rows on GPU (async, only if needed) */
+        if (padLines > 0) {
+            cu->cuMemsetD8Async(enc->gpuBuf + enc->gpuBufPitch * frame_height,
+                                0, enc->gpuBufPitch * padLines, 0);
+            cu->cuMemsetD8Async(enc->gpuBuf + chromaOff_dst + enc->gpuBufPitch * chromaHeight,
+                                128, enc->gpuBufPitch * (padLines / 2), 0);
+        }
+
+        /* Map the persistent registered resource */
+        NV_ENC_MAP_INPUT_RESOURCE mapRes = {0};
+        mapRes.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+        mapRes.registeredResource = enc->gpuBufReg;
+
+        st = enc->funcs.nvEncMapInputResource(enc->encoder, &mapRes);
+        if (st != NV_ENC_SUCCESS) {
+            HELPER_LOG("GPU path: nvEncMapInputResource failed: %d, falling back", st);
+            goto host_fallback;
+        }
+
+        encodeInput = mapRes.mappedResource;
+        encFmt = mapRes.mappedBufferFmt;
+        encodePitch = enc->gpuBufPitch;
+        usedGpuPath = true;
+        goto do_encode;
     }
 
-    /* Only zero the MB-alignment padding rows (e.g. 8 rows for 1080→1088).
-     * Skipped entirely when frame_height == enc->height (no padding). */
-    if (padLines > 0) {
-        /* Luma padding: black (0) */
-        memset(dst + dstPitch * frame_height, 0, dstPitch * padLines);
-        /* Chroma padding: neutral gray (128) */
-        memset(dst + chromaOffset_dst + dstPitch * chromaHeight, 128, dstPitch * (padLines / 2));
+host_fallback:
+    /* HOST FALLBACK: nvEncLockInputBuffer + memcpy (original path) */
+    {
+        NV_ENC_LOCK_INPUT_BUFFER lockIn = {0};
+        lockIn.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
+        lockIn.inputBuffer = enc->inputBuffer;
+
+        st = enc->funcs.nvEncLockInputBuffer(enc->encoder, &lockIn);
+        if (st != NV_ENC_SUCCESS) {
+            HELPER_LOG("nvEncLockInputBuffer failed: %d", st);
+            return false;
+        }
+
+        uint32_t dstPitch = lockIn.pitch;
+        uint8_t *src = (uint8_t *)frame_data;
+        uint8_t *dst = (uint8_t *)lockIn.bufferDataPtr;
+        uint32_t chromaOffset_src = srcPitch * frame_height;
+        uint32_t chromaOffset_dst = dstPitch * enc->height;
+        uint32_t chromaHeight = frame_height / 2;
+        uint32_t padLines = enc->height - frame_height;
+
+        if (srcPitch == dstPitch) {
+            memcpy(dst, src, srcPitch * frame_height);
+            memcpy(dst + chromaOffset_dst, src + chromaOffset_src, srcPitch * chromaHeight);
+        } else {
+            for (uint32_t y = 0; y < frame_height; y++)
+                memcpy(dst + y * dstPitch, src + y * srcPitch, srcPitch);
+            for (uint32_t y = 0; y < chromaHeight; y++)
+                memcpy(dst + chromaOffset_dst + y * dstPitch,
+                       src + chromaOffset_src + y * srcPitch, srcPitch);
+        }
+
+        if (padLines > 0) {
+            memset(dst + dstPitch * frame_height, 0, dstPitch * padLines);
+            memset(dst + chromaOffset_dst + dstPitch * chromaHeight, 128, dstPitch * (padLines / 2));
+        }
+
+        enc->funcs.nvEncUnlockInputBuffer(enc->encoder, enc->inputBuffer);
+        encodeInput = enc->inputBuffer;
+        encodePitch = dstPitch;
     }
 
-    st = enc->funcs.nvEncUnlockInputBuffer(enc->encoder, enc->inputBuffer);
-    if (st != NV_ENC_SUCCESS) {
-        HELPER_LOG("nvEncUnlockInputBuffer failed: %d", st);
-        return false;
-    }
-
+do_encode:;
     /* Encode */
     NV_ENC_PIC_PARAMS picParams = {0};
     picParams.version = NV_ENC_PIC_PARAMS_VER;
-    picParams.inputBuffer = enc->inputBuffer;
-    picParams.bufferFmt = enc->is10bit ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT : NV_ENC_BUFFER_FORMAT_NV12;
+    picParams.inputBuffer = encodeInput;
+    picParams.bufferFmt = encFmt;
     picParams.inputWidth = enc->width;
     picParams.inputHeight = enc->height;
-    picParams.inputPitch = dstPitch;
+    picParams.inputPitch = encodePitch;
     picParams.outputBitstream = enc->outputBuffer;
     picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     picParams.pictureType = NV_ENC_PIC_TYPE_UNKNOWN;
@@ -381,6 +495,12 @@ static bool encoder_encode(HelperEncoder *enc, const void *frame_data,
     picParams.inputTimeStamp = enc->frameCount;
 
     st = enc->funcs.nvEncEncodePicture(enc->encoder, &picParams);
+
+    /* Unmap the GPU resource after encode (must happen before next map) */
+    if (usedGpuPath) {
+        enc->funcs.nvEncUnmapInputResource(enc->encoder, encodeInput);
+    }
+
     if (st != NV_ENC_SUCCESS) {
         HELPER_LOG("nvEncEncodePicture failed: %d", st);
         return false;
@@ -434,6 +554,15 @@ static void encoder_close(HelperEncoder *enc)
     }
     if (enc->inputBuffer) {
         enc->funcs.nvEncDestroyInputBuffer(enc->encoder, enc->inputBuffer);
+    }
+    /* Free persistent GPU buffer */
+    if (enc->gpuBufReady) {
+        enc->funcs.nvEncUnregisterResource(enc->encoder, enc->gpuBufReg);
+        enc->gpuBufReady = false;
+    }
+    if (enc->gpuBuf) {
+        cu->cuMemFree(enc->gpuBuf);
+        enc->gpuBuf = 0;
     }
 
     enc->funcs.nvEncDestroyEncoder(enc->encoder);
