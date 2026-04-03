@@ -9,8 +9,8 @@
  * Usage: nvenc-helper [--foreground]
  * The socket is created at $XDG_RUNTIME_DIR/nvenc-helper.sock
  *
- * The helper exits automatically when the last client disconnects
- * and no new client connects within 30 seconds.
+ * The helper runs persistently until stopped via SIGTERM/SIGINT.
+ * It is managed by a systemd user service (nvenc-helper.service).
  */
 
 #define _GNU_SOURCE
@@ -39,6 +39,10 @@ static CudaFunctions *cu;
 static NvencFunctions *nv_dl;
 static volatile sig_atomic_t running = 1;
 static int log_enabled = 0;
+
+/* Force an IDR keyframe every N frames for streaming error recovery.
+ * At 60fps this is ~1 second. At 30fps this is ~2 seconds. */
+#define NVENC_HELPER_IDR_INTERVAL 60
 
 /* Macro for CUDA error check in helper */
 #define CHECK_CUDA_RESULT_HELPER(err) ({ \
@@ -320,8 +324,11 @@ static bool encoder_encode(HelperEncoder *enc, const void *frame_data,
     uint8_t *src = (uint8_t *)frame_data;
     uint8_t *dst = (uint8_t *)lockIn.bufferDataPtr;
 
-    /* Zero the entire buffer to handle padding cleanly */
-    memset(dst, 0, dstPitch * enc->height * 3 / 2);
+    /* Zero luma + chroma regions separately to avoid writing beyond the buffer.
+     * NVENC's locked buffer size is at least dstPitch * height * 1.5 but
+     * we only zero what we know is safe. */
+    memset(dst, 0, dstPitch * enc->height);                              /* luma */
+    memset(dst + dstPitch * enc->height, 128, dstPitch * enc->height / 2); /* chroma (128=neutral UV) */
 
     /* Copy luma — only frame_height lines from the source */
     for (uint32_t y = 0; y < frame_height; y++) {
@@ -361,7 +368,7 @@ static bool encoder_encode(HelperEncoder *enc, const void *frame_data,
     /* Force IDR: on first frame, on explicit request, or every 60 frames
      * for streaming recovery. Without periodic IDR, a single lost packet
      * causes the client to freeze until the next intra_period (up to 60s). */
-    bool needIDR = (enc->frameCount == 0) || force_idr || (enc->frameCount % 60 == 0);
+    bool needIDR = (enc->frameCount == 0) || force_idr || (enc->frameCount % NVENC_HELPER_IDR_INTERVAL == 0);
     picParams.encodePicFlags = needIDR
         ? (NV_ENC_PIC_FLAG_OUTPUT_SPSPPS | NV_ENC_PIC_FLAG_FORCEIDR)
         : 0;
@@ -491,9 +498,10 @@ static void handle_client(int client_fd)
             if (shm_fd < 0 || ftruncate(shm_fd, shm_size) < 0) {
                 HELPER_LOG("Failed to create shm: %s", strerror(errno));
                 if (shm_fd >= 0) { close(shm_fd); shm_fd = -1; }
-                /* Fall back to socket-based transfer (no shm) */
+                /* Fall back to socket-based transfer (no shm).
+                 * Send normal response without fd (no SCM_RIGHTS with fd=-1). */
                 NVEncIPCInitResponse iresp = { .shm_size = 0 };
-                send_response_with_fd(client_fd, 0, -1, &iresp, sizeof(iresp));
+                send_response(client_fd, 0, &iresp, sizeof(iresp));
                 break;
             }
 
@@ -503,7 +511,7 @@ static void handle_client(int client_fd)
                 close(shm_fd);
                 shm_fd = -1;
                 NVEncIPCInitResponse iresp = { .shm_size = 0 };
-                send_response_with_fd(client_fd, 0, -1, &iresp, sizeof(iresp));
+                send_response(client_fd, 0, &iresp, sizeof(iresp));
                 break;
             }
 
@@ -517,11 +525,14 @@ static void handle_client(int client_fd)
         }
 
         case NVENC_IPC_CMD_ENCODE: {
-            if (!enc.initialized) {
-                /* Drain the payload */
-                if (hdr.payload_size > 0) {
-                    void *tmp = malloc(hdr.payload_size);
-                    if (tmp) { recv_all(client_fd, tmp, hdr.payload_size); free(tmp); }
+            if (!enc.initialized || hdr.payload_size > NVENC_IPC_MAX_FRAME_SIZE + sizeof(NVEncIPCEncodeParams)) {
+                /* Drain the payload with a fixed buffer to avoid huge malloc */
+                char drain[4096];
+                uint32_t remaining = hdr.payload_size;
+                while (remaining > 0) {
+                    uint32_t chunk = remaining < sizeof(drain) ? remaining : sizeof(drain);
+                    if (!recv_all(client_fd, drain, chunk)) goto done;
+                    remaining -= chunk;
                 }
                 send_response(client_fd, -1, NULL, 0);
                 break;
@@ -529,6 +540,12 @@ static void handle_client(int client_fd)
 
             NVEncIPCEncodeParams ep;
             if (!recv_all(client_fd, &ep, sizeof(ep))) goto done;
+
+            if (ep.frame_size > NVENC_IPC_MAX_FRAME_SIZE) {
+                HELPER_LOG("CMD_ENCODE: frame_size %u exceeds max %u", ep.frame_size, NVENC_IPC_MAX_FRAME_SIZE);
+                send_response(client_fd, -1, NULL, 0);
+                goto done;
+            }
 
             /* Receive frame data */
             void *frame = malloc(ep.frame_size);
@@ -681,7 +698,12 @@ static void handle_client(int client_fd)
                 for (int i = 0; i < 4; i++) {
                     if (mipmaps[i]) cu->cuMipmappedArrayDestroy(mipmaps[i]);
                     if (extMems[i]) cu->cuDestroyExternalMemory(extMems[i]);
-                    else if (dmabuf_fds[i] >= 0) close(dmabuf_fds[i]);
+                    /* Close any fds that CUDA didn't take ownership of */
+                    else if (i < num_fds && dmabuf_fds[i] >= 0) close(dmabuf_fds[i]);
+                }
+                /* Close remaining fds beyond what we tried to import */
+                for (int i = (int)dp.num_planes; i < num_fds; i++) {
+                    if (dmabuf_fds[i] >= 0) close(dmabuf_fds[i]);
                 }
                 cu->cuCtxPopCurrent(NULL);
                 send_response(client_fd, -1, NULL, 0);
@@ -697,7 +719,11 @@ static void handle_client(int client_fd)
             uint32_t totalSize = lumaSize + chromaSize;
 
             CUdeviceptr linearBuf = 0;
-            cu->cuMemAlloc(&linearBuf, totalSize);
+            CUresult cres = cu->cuMemAlloc(&linearBuf, totalSize);
+            if (cres != CUDA_SUCCESS) {
+                HELPER_LOG("DMABUF: cuMemAlloc(%u) failed: %d", totalSize, cres);
+                goto dmabuf_cleanup;
+            }
             cu->cuMemsetD8Async(linearBuf, 0, totalSize, 0);
 
             /* Copy luma */
@@ -709,7 +735,12 @@ static void handle_client(int client_fd)
             cpy.dstPitch = pitch;
             cpy.WidthInBytes = dp.width * bpp;
             cpy.Height = dp.height;
-            cu->cuMemcpy2D(&cpy);
+            cres = cu->cuMemcpy2D(&cpy);
+            if (cres != CUDA_SUCCESS) {
+                HELPER_LOG("DMABUF: luma cuMemcpy2D failed: %d", cres);
+                cu->cuMemFree(linearBuf);
+                goto dmabuf_cleanup;
+            }
 
             /* Copy chroma */
             if (dp.num_planes >= 2 && arrays[1]) {
@@ -721,7 +752,12 @@ static void handle_client(int client_fd)
                 cpy.dstPitch = pitch;
                 cpy.WidthInBytes = dp.width * bpp;
                 cpy.Height = dp.height / 2;
-                cu->cuMemcpy2D(&cpy);
+                cres = cu->cuMemcpy2D(&cpy);
+                if (cres != CUDA_SUCCESS) {
+                    HELPER_LOG("DMABUF: chroma cuMemcpy2D failed: %d", cres);
+                    cu->cuMemFree(linearBuf);
+                    goto dmabuf_cleanup;
+                }
             }
 
             /* Register linear buffer with NVENC */

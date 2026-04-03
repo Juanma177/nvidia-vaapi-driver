@@ -1579,7 +1579,7 @@ static VAStatus nvMapBuffer(
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     NVBuffer *buf = getObjectPtr(drv, OBJECT_TYPE_BUFFER, buf_id);
 
-    if (buf == NULL) {
+    if (buf == NULL || buf->ptr == NULL) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
 

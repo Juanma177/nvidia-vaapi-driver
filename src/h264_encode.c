@@ -53,8 +53,11 @@ void h264enc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
     VAEncPictureParameterBufferH264 *pic =
         (VAEncPictureParameterBufferH264*) buffer->ptr;
 
-    LOG("H264 encode: picture params, coded_buf=%d, pic_fields=0x%x",
-        pic->coded_buf, pic->pic_fields.value);
+    /* Only log first few frames to avoid flooding at 60fps */
+    if (nvencCtx->frameCount < 3) {
+        LOG("H264 encode: picture params, coded_buf=%d, pic_fields=0x%x",
+            pic->coded_buf, pic->pic_fields.value);
+    }
 
     nvencCtx->currentCodedBufId = pic->coded_buf;
     nvencCtx->forceIDR = (pic->pic_fields.bits.idr_pic_flag != 0);

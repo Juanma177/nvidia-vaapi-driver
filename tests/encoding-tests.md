@@ -214,3 +214,39 @@ The driver advertises support for `VA_ENC_PACKED_HEADER_SEQUENCE` and
 headers into the bitstream. NVENC generates its own SPS/PPS/VPS headers.
 Applications that require custom packed header insertion should use ffmpeg's
 native NVENC encoders.
+
+---
+
+## Edge cases and failure modes
+
+### Potential failures documented
+
+| Scenario | Behavior | Mitigation |
+|----------|----------|------------|
+| `cuInit()` fails in 64-bit | Driver falls back to IPC mode (same as 32-bit) | Helper handles encoding |
+| `nvenc-helper` not running | Driver tries to auto-start from `/usr/libexec/nvenc-helper` | Logs error if not found |
+| `nvenc-helper` crashes mid-encode | 5s `SO_RCVTIMEO` on socket, then reconnect on next frame | Steam restarts encoder |
+| `memfd_create` fails (old kernel) | Falls back to socket-based frame transfer (slower) | Transparent fallback |
+| Malicious/corrupt socket data | `frame_size` capped at 64MB, drain with fixed buffer | No malloc bomb |
+| Resolution change mid-stream | Steam destroys+recreates context, new SHM allocated | Clean re-init |
+| Surface height != encoder height | Copy only surface lines, zero-pad MB-aligned remainder | 1080→1088 padding |
+| Client requests IDR after packet loss | `idr_pic_flag` forwarded to NVENC `FORCEIDR` | Recovery in 1 frame |
+| No IDR request for 60 frames | Periodic IDR every 60 frames regardless | Recovery in ~1 second |
+| `vaDeriveImage` on same surface reused | Returns same `hostPixelData`, sentinel prevents double-free | Safe aliasing |
+| Multiple sequential encode sessions | Objects cleaned up per-session, IDs grow monotonically | No leak |
+| B-frames requested (`ip_period > 1`) | Forced to `frameIntervalP=1` | ffmpeg 6.x compat |
+| NVENC session limit reached (GPU max) | `nvEncOpenEncodeSessionEx` fails, error returned | Clean failure |
+| Helper receives 0-byte frame | Encodes empty/black frame | Valid HEVC output |
+| `vaExportSurfaceHandle` in IPC mode | CUDA push/pop guards skipped | DRM fds still exported |
+
+### Known non-working scenarios
+
+| Scenario | Status | Reason |
+|----------|--------|--------|
+| B-frame encoding via VA-API | Crashes ffmpeg 6.x | `vaapi_encode` asserts on empty coded buffer from `NEED_MORE_INPUT` |
+| Custom packed header injection | Headers ignored | NVENC generates its own SPS/PPS/VPS |
+| Hardware decode in 32-bit IPC mode | Not available | CUDA required for NVDEC, unavailable in IPC mode |
+| AV1 encoding | Not implemented | NVENC supports AV1 but no VA-API handler written |
+| HEVC 4:4:4 encoding | Not implemented | Could be added with `NV_ENC_HEVC_PROFILE_FREXT_GUID` |
+| Multiple concurrent encode streams | Single-client helper | Helper handles one client at a time |
+| DMA-BUF zero-copy from Steam | Not used by Steam | Steam uses `vaDeriveImage` host path instead |

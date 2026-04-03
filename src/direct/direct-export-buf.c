@@ -264,6 +264,10 @@ static void destroyBackingImage(NVDriver *drv, BackingImage *img) {
         if (img->fds[i] > 0) {
             close(img->fds[i]);
         }
+        /* Close NVIDIA opaque fds kept for IPC encode mode */
+        if (img->nvFds[i] > 0) {
+            close(img->nvFds[i]);
+        }
     }
 
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {

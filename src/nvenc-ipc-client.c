@@ -190,7 +190,11 @@ int nvenc_ipc_init(int fd, const NVEncIPCInitParams *params,
         }
     }
 
-    if (shm_fd_out) *shm_fd_out = shm_fd;
+    if (shm_fd_out) {
+        *shm_fd_out = shm_fd;
+    } else if (shm_fd >= 0) {
+        close(shm_fd);
+    }
     if (shm_size_out) *shm_size_out = init_resp.shm_size;
 
     return 0;

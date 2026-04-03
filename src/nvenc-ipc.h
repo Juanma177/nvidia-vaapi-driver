@@ -21,6 +21,9 @@
 
 #define NVENC_IPC_SOCK_NAME "nvenc-helper.sock"
 
+/* Maximum frame size we'll accept over the socket (64MB, enough for 8K NV12) */
+#define NVENC_IPC_MAX_FRAME_SIZE (64 * 1024 * 1024)
+
 /* Commands */
 #define NVENC_IPC_CMD_INIT    1  /* Initialize encoder */
 #define NVENC_IPC_CMD_ENCODE  2  /* Encode a frame (host pixel data) */
