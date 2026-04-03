@@ -1,6 +1,6 @@
 # PR: Add NVENC Encoding Support via VA-API
 
-> **Disclaimer:** This implementation was totally vibe coded in a single session — from zero to working Steam Remote Play on NVIDIA Linux in one sitting. It works, it's tested, but it carries the energy of 3AM debugging and "just one more fix". Review accordingly.
+> **Disclaimer:** This implementation was totally vibe coded in a single session — from zero to working Steam Remote Play on NVIDIA Linux in one sitting. I had a Windows + WSL long-running Ubuntu setup but was sad to reintroduce this at home when I switched to native Linux. Instead of going back to Windows, I decided to fix my Steam Remote Play setup with AI. It works, it's tested, but it carries the energy of 3AM debugging and "just one more fix". Review accordingly.
 
 ## TL;DR
 
