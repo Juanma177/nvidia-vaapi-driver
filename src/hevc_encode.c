@@ -3,10 +3,10 @@
 #include <string.h>
 #include <va/va.h>
 
-void hevcenc_handle_sequence_params(NVENCContext *nvencCtx, void *buffer_ptr)
+void hevcenc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
     VAEncSequenceParameterBufferHEVC *seq =
-        (VAEncSequenceParameterBufferHEVC*) ((NVBuffer*)buffer_ptr)->ptr;
+        (VAEncSequenceParameterBufferHEVC*) buffer->ptr;
 
     LOG("HEVC encode: seq params %ux%u, intra_period=%u, ip_period=%u",
         seq->pic_width_in_luma_samples, seq->pic_height_in_luma_samples,
@@ -39,10 +39,10 @@ void hevcenc_handle_sequence_params(NVENCContext *nvencCtx, void *buffer_ptr)
     nvencCtx->seqParamSet = true;
 }
 
-void hevcenc_handle_picture_params(NVENCContext *nvencCtx, void *buffer_ptr)
+void hevcenc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
     VAEncPictureParameterBufferHEVC *pic =
-        (VAEncPictureParameterBufferHEVC*) ((NVBuffer*)buffer_ptr)->ptr;
+        (VAEncPictureParameterBufferHEVC*) buffer->ptr;
 
     nvencCtx->currentCodedBufId = pic->coded_buf;
     nvencCtx->forceIDR = (pic->pic_fields.bits.idr_pic_flag != 0);
@@ -51,10 +51,10 @@ void hevcenc_handle_picture_params(NVENCContext *nvencCtx, void *buffer_ptr)
     }
 }
 
-void hevcenc_handle_slice_params(NVENCContext *nvencCtx, void *buffer_ptr)
+void hevcenc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
     VAEncSliceParameterBufferHEVC *slice =
-        (VAEncSliceParameterBufferHEVC*) ((NVBuffer*)buffer_ptr)->ptr;
+        (VAEncSliceParameterBufferHEVC*) buffer->ptr;
 
     /* Map VA-API HEVC slice_type to NVENC picture type.
      * HEVC slice types: 0=B, 1=P, 2=I */
@@ -75,9 +75,9 @@ void hevcenc_handle_slice_params(NVENCContext *nvencCtx, void *buffer_ptr)
     }
 }
 
-void hevcenc_handle_misc_params(NVENCContext *nvencCtx, void *buffer_ptr)
+void hevcenc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
-    VAEncMiscParameterBuffer *misc = (VAEncMiscParameterBuffer*) ((NVBuffer*)buffer_ptr)->ptr;
+    VAEncMiscParameterBuffer *misc = (VAEncMiscParameterBuffer*) buffer->ptr;
 
     switch (misc->type) {
     case VAEncMiscParameterTypeRateControl: {

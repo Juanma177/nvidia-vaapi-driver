@@ -3,10 +3,10 @@
 #include <string.h>
 #include <va/va.h>
 
-void h264enc_handle_sequence_params(NVENCContext *nvencCtx, void *buffer_ptr)
+void h264enc_handle_sequence_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
     VAEncSequenceParameterBufferH264 *seq =
-        (VAEncSequenceParameterBufferH264*) ((NVBuffer*)buffer_ptr)->ptr;
+        (VAEncSequenceParameterBufferH264*) buffer->ptr;
 
     LOG("H264 encode: seq params %ux%u, intra_period=%u, ip_period=%u",
         seq->picture_width_in_mbs * 16, seq->picture_height_in_mbs * 16,
@@ -40,10 +40,10 @@ void h264enc_handle_sequence_params(NVENCContext *nvencCtx, void *buffer_ptr)
     nvencCtx->seqParamSet = true;
 }
 
-void h264enc_handle_picture_params(NVENCContext *nvencCtx, void *buffer_ptr)
+void h264enc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
     VAEncPictureParameterBufferH264 *pic =
-        (VAEncPictureParameterBufferH264*) ((NVBuffer*)buffer_ptr)->ptr;
+        (VAEncPictureParameterBufferH264*) buffer->ptr;
 
     /* Only log first few frames to avoid flooding at 60fps */
     if (nvencCtx->frameCount < 3) {
@@ -58,10 +58,10 @@ void h264enc_handle_picture_params(NVENCContext *nvencCtx, void *buffer_ptr)
     }
 }
 
-void h264enc_handle_slice_params(NVENCContext *nvencCtx, void *buffer_ptr)
+void h264enc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
     VAEncSliceParameterBufferH264 *slice =
-        (VAEncSliceParameterBufferH264*) ((NVBuffer*)buffer_ptr)->ptr;
+        (VAEncSliceParameterBufferH264*) buffer->ptr;
 
     /* Map VA-API H.264 slice_type to NVENC picture type.
      * Currently unused (enablePTD=1), but kept for future B-frame support. */
@@ -82,9 +82,9 @@ void h264enc_handle_slice_params(NVENCContext *nvencCtx, void *buffer_ptr)
     }
 }
 
-void h264enc_handle_misc_params(NVENCContext *nvencCtx, void *buffer_ptr)
+void h264enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
-    VAEncMiscParameterBuffer *misc = (VAEncMiscParameterBuffer*) ((NVBuffer*)buffer_ptr)->ptr;
+    VAEncMiscParameterBuffer *misc = (VAEncMiscParameterBuffer*) buffer->ptr;
 
     switch (misc->type) {
     case VAEncMiscParameterTypeRateControl: {
