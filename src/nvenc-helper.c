@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
@@ -44,24 +45,31 @@ static int log_enabled = 0;
  * At 60fps this is ~1 second. At 30fps this is ~2 seconds. */
 #define NVENC_HELPER_IDR_INTERVAL 60
 
-/* Macro for CUDA error check in helper */
-#define CHECK_CUDA_RESULT_HELPER(err) ({ \
-    CUresult _r = (err); \
-    if (_r != CUDA_SUCCESS) { \
-        const char *_s = NULL; \
-        cu->cuGetErrorString(_r, &_s); \
-        HELPER_LOG("CUDA error: %s (%d)", _s ? _s : "?", _r); \
-    } \
-    _r != CUDA_SUCCESS; \
-})
+static inline bool check_cuda_helper(CUresult err, const char *func, int line) {
+    if (err != CUDA_SUCCESS) {
+        const char *s = NULL;
+        cu->cuGetErrorString(err, &s);
+        fprintf(stderr, "[nvenc-helper] CUDA error: %s (%d) at %s:%d\n",
+                s ? s : "?", err, func, line);
+        return true;
+    }
+    return false;
+}
+#define CHECK_CUDA_RESULT_HELPER(err) check_cuda_helper(err, __func__, __LINE__)
 
-#define HELPER_LOG(fmt, ...) do { \
-    if (log_enabled) { \
-        struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts); \
-        fprintf(stderr, "[nvenc-helper %ld.%03ld] " fmt "\n", \
-                (long)_ts.tv_sec, _ts.tv_nsec / 1000000, ##__VA_ARGS__); \
-    } \
-} while (0)
+static void helper_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void helper_log(const char *fmt, ...) {
+    if (!log_enabled) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    fprintf(stderr, "[nvenc-helper %ld.%03ld] ", (long)ts.tv_sec, ts.tv_nsec / 1000000);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fputc('\n', stderr);
+}
+#define HELPER_LOG helper_log
 
 /* Per-client encoder state */
 typedef struct {

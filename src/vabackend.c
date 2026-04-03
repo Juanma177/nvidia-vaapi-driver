@@ -1671,12 +1671,6 @@ static VAStatus nvBeginPicture(
     if (nvCtx->isEncode) {
         nvCtx->renderTarget = surface;
         surface->context = nvCtx;
-        Object surfObj = getObject(drv, OBJECT_TYPE_SURFACE, render_target);
-        if (nvCtx->encodeData && ((NVENCContext*)nvCtx->encodeData)->frameCount < 5) {
-            LOG("BeginPicture encode: surface_id=%d (%p) hasHostData=%d hostSize=%u",
-                render_target, surface,
-                surface->hostPixelData != NULL, surface->hostPixelSize);
-        }
         return VA_STATUS_SUCCESS;
     }
 

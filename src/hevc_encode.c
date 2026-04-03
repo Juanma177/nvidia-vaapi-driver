@@ -53,7 +53,7 @@ void hevcenc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 
 void hevcenc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
-    VAEncSliceParameterBufferHEVC *slice =
+    const VAEncSliceParameterBufferHEVC *slice =
         (VAEncSliceParameterBufferHEVC*) buffer->ptr;
 
     /* Map VA-API HEVC slice_type to NVENC picture type.
@@ -95,7 +95,7 @@ void hevcenc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
         break;
     }
     case VAEncMiscParameterTypeFrameRate: {
-        VAEncMiscParameterFrameRate *fr =
+        const VAEncMiscParameterFrameRate *fr =
             (VAEncMiscParameterFrameRate*) misc->data;
         if (fr->framerate > 0) {
             uint32_t num = fr->framerate & 0xffff;

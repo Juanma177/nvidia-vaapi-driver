@@ -60,7 +60,7 @@ void h264enc_handle_picture_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 
 void h264enc_handle_slice_params(NVENCContext *nvencCtx, NVBuffer *buffer)
 {
-    VAEncSliceParameterBufferH264 *slice =
+    const VAEncSliceParameterBufferH264 *slice =
         (VAEncSliceParameterBufferH264*) buffer->ptr;
 
     /* Map VA-API H.264 slice_type to NVENC picture type.
@@ -103,7 +103,7 @@ void h264enc_handle_misc_params(NVENCContext *nvencCtx, NVBuffer *buffer)
         break;
     }
     case VAEncMiscParameterTypeFrameRate: {
-        VAEncMiscParameterFrameRate *fr =
+        const VAEncMiscParameterFrameRate *fr =
             (VAEncMiscParameterFrameRate*) misc->data;
         if (fr->framerate > 0) {
             /* framerate can be packed as (num | (den << 16)) or just num */
