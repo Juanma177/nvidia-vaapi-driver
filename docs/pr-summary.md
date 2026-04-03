@@ -1,12 +1,12 @@
 # PR: Add NVENC Encoding Support via VA-API
 
-> **Disclaimer:** This implementation was totally vibe coded in a single session — from zero to working Steam Remote Play on NVIDIA Linux in one sitting. I had a Windows + WSL long-running Ubuntu setup but was sad to reintroduce this at home when I switched to native Linux. Instead of going back to Windows, I decided to fix my Steam Remote Play setup with AI. It works, it's tested, but it carries the energy of 3AM debugging and "just one more fix". Review accordingly.
+> **Disclaimer:** This implementation was totally vibe coded in a single session — from zero to working Steam Remote Play on NVIDIA Linux in one sitting. It works, it's tested, but it carries the energy of 3AM debugging and "just one more fix". Review accordingly.
 
 ## TL;DR
 
 This PR adds `VAEntrypointEncSlice` (hardware encoding) to nvidia-vaapi-driver by wrapping NVIDIA's NVENC API. Any application using VA-API for encoding — Steam Remote Play, ffmpeg, GStreamer, OBS — can now use NVIDIA hardware encoding on Linux.
 
-The killer feature: a **shared memory bridge** that makes encoding work even when 32-bit CUDA is broken (Blackwell GPUs + driver 580+), which is the exact scenario that breaks Steam Remote Play for every NVIDIA user on Linux.
+The workaround for 32 -> missing Cuda 32bits lib: a **shared memory bridge** that makes encoding work even when 32-bit CUDA is broken (Blackwell GPUs + driver 580+), which is the exact scenario that breaks Steam Remote Play for every NVIDIA user on Linux.
 
 ## What was broken
 
@@ -17,7 +17,7 @@ Steam Remote Play encoding pipeline on NVIDIA Linux:
 3. Fallback to libx264 software → 20fps, unusable
 ```
 
-This has been open for 10+ years. Issue #116 (45+ thumbs up). Affects every NVIDIA GPU user on Linux who wants Steam Remote Play.
+This has been open for 2+ years. Issue #116 (45+ thumbs up). Affects every NVIDIA GPU user on Linux who wants Steam Remote Play.
 
 ## What this PR does
 
@@ -64,6 +64,17 @@ Getting from "vainfo shows EncSlice" to "Steam Remote Play actually works" requi
 
 ## Test results
 
+45 automated tests via `meson test`, plus manual Steam validation.
+
+### Automated C test suite (`meson test`)
+
+| Suite | Tests | Status |
+|-------|-------|--------|
+| `test_encode` — full encode cycles, leak checks | 11 | All PASS |
+| `test_encode_config` — capabilities, error paths, surfaces | 34 | All PASS |
+
+### Manual integration tests
+
 | Test | Status |
 |------|--------|
 | vainfo encode entrypoints | PASS — 5 EncSlice profiles |
@@ -79,6 +90,38 @@ Getting from "vainfo shows EncSlice" to "Steam Remote Play actually works" requi
 | Steam Remote Play (Mac Steam Link) | PASS — VAAPI H264, 60fps, 0% loss |
 | Steam Remote Play (Legion Go) | PASS — VAAPI HEVC, 60fps |
 | nvenc-helper systemd service | PASS — auto-start, auto-restart |
+
+## Performance optimizations
+
+The shared memory bridge went through several optimization rounds:
+
+| Optimization | Encode time | What changed |
+|-------------|-------------|--------------|
+| Baseline (socket transfer) | ~8ms | 3MB frame sent over Unix socket per frame |
+| Shared memory (memfd) | ~6ms | Frame data in SHM, only 16-byte signal over socket |
+| SHM zero-copy redirect | ~5ms | `vaDeriveImage` maps directly to SHM, skip memcpy |
+| Eliminate redundant memset | ~4ms | Only zero 8 padding rows, not entire 3MB buffer |
+| Persistent CUDA buffer + cuMemcpy2D | **~3.5ms** | GPU DMA engine handles host→device + pitch in HW |
+
+Final pipeline (1080p NV12):
+```
+Steam writes NV12 → SHM (zero-copy via vaDeriveImage)
+  → 16-byte signal via socket
+  → Helper: 2× cuMemcpy2D (host→device, DMA engine) → persistent CUDA buffer
+  → NVENC encodes from VRAM (no PCIe upload at encode time)
+  → Bitstream back via socket (~10-30KB)
+```
+
+## Code hardening
+
+All code reviewed for production reliability:
+- All CUDA/NVENC return values checked (no silent failures)
+- Socket frame_size capped at 64MB (prevents malloc bomb from corrupt data)
+- File descriptors tracked and closed (no fd leaks, verified with /proc/pid/fd)
+- Dead client detection via SO_RCVTIMEO (5s timeout)
+- Derived image buffer ownership tracked (sentinel prevents double-free)
+- DMA-BUF fds properly closed on partial import failure
+- NVIDIA opaque fds closed in surface destroy
 
 ## Known limitations
 
@@ -118,6 +161,14 @@ When the shared memory bridge is active (Blackwell 32-bit), only encoding works 
 | `src/direct/direct-export-buf.c` | CUDA-optional surface allocation |
 | `meson.build` | New sources + helper binary |
 
+### Test files (4)
+| File | Role |
+|------|------|
+| `tests/test_encode.c` | 11 encode cycle integration tests |
+| `tests/test_encode_config.c` | 34 config/capability/surface tests |
+| `tests/test_common.h` | Shared test framework (macros, timer, setup) |
+| `tests/encoding-tests.md` | Manual test documentation + edge cases |
+
 ### Supporting files (4)
 | File | Role |
 |------|------|
@@ -125,7 +176,7 @@ When the shared memory bridge is active (Blackwell 32-bit), only encoding works 
 | `install.sh` | Build + install both archs + systemd |
 | `nvenc-helper.service` | Systemd user service |
 | `docs/nvenc-encoding.md` | Full architecture documentation |
-| `tests/encoding-tests.md` | 12 test cases |
+| `docs/pr-summary.md` | This document |
 
 ## Comparison with PR #425
 
