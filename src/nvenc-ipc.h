@@ -6,11 +6,12 @@
 #include <stdbool.h>
 
 /*
- * IPC protocol between the 32-bit VA-API driver and the 64-bit NVENC helper.
+ * IPC protocol between the VA-API driver and the 64-bit NVENC helper.
  *
- * The 32-bit driver cannot use CUDA (cuInit fails on Blackwell GPUs),
- * so it delegates all GPU encoding work to a 64-bit helper process via
- * a Unix domain socket.
+ * When CUDA is unavailable (e.g. 32-bit process on Blackwell GPUs where
+ * cuInit fails), the driver delegates encoding to a 64-bit helper process
+ * via a Unix domain socket. On systems where CUDA works, the driver uses
+ * NVENC directly without the helper.
  *
  * Socket path: /run/user/<uid>/nvenc-helper.sock
  *
@@ -89,7 +90,7 @@ typedef struct {
     uint32_t force_idr;
 } NVEncIPCEncodeShmParams;
 
-/* IPC client functions (used by the 32-bit driver) */
+/* IPC client functions (used by the driver when CUDA is unavailable) */
 
 /* Get the socket path for this user */
 bool nvenc_ipc_get_socket_path(char *buf, size_t bufsize);

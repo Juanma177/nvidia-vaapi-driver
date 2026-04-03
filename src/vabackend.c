@@ -1320,7 +1320,8 @@ static VAStatus nvCreateContext(
             }
             nvencCtx->useIPC = false;
         } else {
-            /* IPC path (32-bit, CUDA broken — use 64-bit helper) */
+            /* IPC path: CUDA unavailable (e.g. 32-bit on Blackwell).
+             * Encoding delegated to 64-bit nvenc-helper via Unix socket. */
             LOG("Using IPC encode path (CUDA unavailable)");
             nvencCtx->useIPC = true;
         }
@@ -2669,7 +2670,7 @@ static VAStatus nvPutImage(
 
     const NVFormatInfo *fmtInfo = &formatsInfo[imageObj->format];
 
-    /* Host-memory path: when CUDA is unavailable (32-bit encode-only mode),
+    /* Host-memory path: when CUDA is unavailable (IPC encode-only mode),
      * store pixel data directly in the surface for later IPC transmission. */
     if (!drv->cudaAvailable) {
         uint32_t totalSize = imageObj->imageBuffer->size;

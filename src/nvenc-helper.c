@@ -2,7 +2,7 @@
  * nvenc-helper: 64-bit NVENC encode helper daemon.
  *
  * This standalone process runs as 64-bit, where CUDA works on all GPUs.
- * It receives raw NV12/P010 frames from the 32-bit VA-API driver via
+ * It receives raw NV12/P010 frames from the VA-API driver via
  * a Unix domain socket, encodes them with NVENC, and returns the
  * encoded bitstream.
  *
