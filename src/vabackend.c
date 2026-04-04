@@ -2919,17 +2919,37 @@ static VAStatus nvQuerySurfaceAttributes(
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
 
-    /* Encode config: return minimal surface attributes */
+    /* Encode config surface attributes — GStreamer needs min/max dimensions */
     if (cfg->isEncode) {
-        int cnt = 1;
+        int cnt = 5;
         if (num_attribs != NULL) {
             *num_attribs = cnt;
         }
         if (attrib_list != NULL) {
-            attrib_list[0].type = VASurfaceAttribPixelFormat;
-            attrib_list[0].flags = 0;
+            attrib_list[0].type = VASurfaceAttribMinWidth;
+            attrib_list[0].flags = VA_SURFACE_ATTRIB_GETTABLE;
             attrib_list[0].value.type = VAGenericValueTypeInteger;
-            attrib_list[0].value.value.i = (cfg->bitDepth > 8) ? VA_FOURCC_P010 : VA_FOURCC_NV12;
+            attrib_list[0].value.value.i = 16;
+
+            attrib_list[1].type = VASurfaceAttribMinHeight;
+            attrib_list[1].flags = VA_SURFACE_ATTRIB_GETTABLE;
+            attrib_list[1].value.type = VAGenericValueTypeInteger;
+            attrib_list[1].value.value.i = 16;
+
+            attrib_list[2].type = VASurfaceAttribMaxWidth;
+            attrib_list[2].flags = VA_SURFACE_ATTRIB_GETTABLE;
+            attrib_list[2].value.type = VAGenericValueTypeInteger;
+            attrib_list[2].value.value.i = 4096;
+
+            attrib_list[3].type = VASurfaceAttribMaxHeight;
+            attrib_list[3].flags = VA_SURFACE_ATTRIB_GETTABLE;
+            attrib_list[3].value.type = VAGenericValueTypeInteger;
+            attrib_list[3].value.value.i = 4096;
+
+            attrib_list[4].type = VASurfaceAttribPixelFormat;
+            attrib_list[4].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+            attrib_list[4].value.type = VAGenericValueTypeInteger;
+            attrib_list[4].value.value.i = (cfg->bitDepth > 8) ? VA_FOURCC_P010 : VA_FOURCC_NV12;
         }
         return VA_STATUS_SUCCESS;
     }
