@@ -120,6 +120,13 @@ if not meson.is_cross_build()
     test_encode_config = executable('test_encode_config', 'tests/test_encode_config.c',
         dependencies : libva_test_deps, install : false)
     test('encode_config', test_encode_config, timeout : 60)
+
+    gst_launch = find_program('gst-launch-1.0', required : false)
+    if gst_launch.found()
+        test('gstreamer', find_program('tests/test_gstreamer.sh'),
+             timeout : 120,
+             env : ['GST_VAAPI_ALL_DRIVERS=1', 'LIBVA_DRIVER_NAME=nvidia'])
+    endif
 endif
 
 meson.add_devenv(environment({
