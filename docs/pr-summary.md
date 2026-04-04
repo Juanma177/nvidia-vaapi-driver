@@ -1,12 +1,12 @@
 # PR: Add NVENC Encoding Support via VA-API
 
-> **Disclaimer:** This implementation was totally vibe coded in a single session — from zero to working Steam Remote Play on NVIDIA Linux in one sitting. It works, it's tested, but it carries the energy of 3AM debugging and "just one more fix". Review accordingly.
+> **Disclaimer:** I had a Windows + WSL long-running Ubuntu setup but was sad to reintroduce this at home when I switched to native Linux. Instead of going back to Windows, I decided to fix my Steam Remote Play setup with AI. It works, it's tested, but it carries the energy of 3AM debugging and "just one more fix". Review accordingly.
 
 ## TL;DR
 
-This PR adds `VAEntrypointEncSlice` (hardware encoding) to nvidia-vaapi-driver by wrapping NVIDIA's NVENC API. Any application using VA-API for encoding — Steam Remote Play, ffmpeg, GStreamer, OBS — can now use NVIDIA hardware encoding on Linux.
+This PR adds `VAEntrypointEncSlice` (hardware encoding) to nvidia-vaapi-driver by wrapping NVIDIA's NVENC API. Any application using VA-API for encoding — Steam Remote Play, ffmpeg, GStreamer, OBS, Chromium — can now use NVIDIA hardware encoding on Linux.
 
-The workaround for 32 -> missing Cuda 32bits lib: a **shared memory bridge** that makes encoding work even when 32-bit CUDA is broken (Blackwell GPUs + driver 580+), which is the exact scenario that breaks Steam Remote Play for every NVIDIA user on Linux.
+For Blackwell GPUs (RTX 50xx) where NVIDIA dropped 32-bit CUDA support, a **shared memory bridge** delegates encoding to a 64-bit helper daemon. This is the exact scenario that breaks Steam Remote Play for every NVIDIA user on Linux.
 
 ## What was broken
 
@@ -29,23 +29,22 @@ Adds `VAEntrypointEncSlice` for:
 
 After this, `vainfo` shows encode entrypoints alongside the existing decode entrypoints. ffmpeg `h264_vaapi` and `hevc_vaapi` work out of the box.
 
-### 2. Shared memory bridge for 32-bit Steam
+### 2. Shared memory bridge (when CUDA is unavailable)
 
-On Blackwell GPUs, 32-bit `cuInit()` fails with error 100. The entire nvidia-vaapi-driver depends on CUDA, so nothing works in 32-bit. Steam's encoding runs in a 32-bit process (`steamui.so`).
+On Blackwell GPUs, 32-bit `cuInit()` fails with error 100. Steam's encoding runs in a 32-bit process (`steamui.so`).
 
-Solution: a 64-bit helper daemon (`nvenc-helper`) that does the CUDA/NVENC work. The 32-bit driver communicates via shared memory (for frame pixels) and a Unix socket (for control commands and encoded bitstream).
+Solution: a 64-bit helper daemon (`nvenc-helper`) that does the CUDA/NVENC work. The 32-bit driver communicates via shared memory (for frame pixels) and a Unix socket (for control and bitstream).
 
 ```
-Steam 32-bit → vaDeriveImage → write NV12 pixels to host buffer
-  → memcpy to shared memory (memfd, 3MB) 
-  → signal via Unix socket (16 bytes)
-    → nvenc-helper 64-bit: read from shm → NVENC encode
+Steam 32-bit → vaDeriveImage → writes NV12 directly to shared memory
+  → 16-byte signal via Unix socket
+    → nvenc-helper 64-bit: cuMemcpy2D from SHM → persistent GPU buffer → NVENC
     ← HEVC/H.264 bitstream via socket (~10-30KB)
   ← VA-API coded buffer filled
 ← Steam streams to client
 ```
 
-The bridge activates **only** when `cuInit()` fails. On systems where 32-bit CUDA works (Turing, Ampere, Ada), the driver uses NVENC directly — no helper, no overhead.
+The bridge activates **only** when `cuInit()` fails. On systems where CUDA works (64-bit, or 32-bit pre-Blackwell), the driver uses NVENC directly — no helper, no overhead.
 
 ### 3. Everything else that was needed
 
@@ -56,15 +55,14 @@ Getting from "vainfo shows EncSlice" to "Steam Remote Play actually works" requi
 | `vaDeriveImage` implementation | Steam writes captured frames through derived images, not `vaPutImage` |
 | DRM surface allocation without CUDA | GPU-backed surfaces via kernel DRM ioctls, no CUDA needed |
 | NV12 pitch/height alignment | Encoder uses 1088 (MB-aligned), surface has 1080 — copy only 1080 lines |
-| Frame snapshot before IPC send | Prevent tearing from Steam writing next frame while sending current |
 | Periodic IDR keyframes (every 60 frames) | Steam sets `intra_period=3600` — client can't recover from packet loss |
 | IDR on `idr_pic_flag` from picture params | Forward client keyframe requests to NVENC |
-| Dead client timeout on helper socket | Helper was blocking forever on dead connections |
+| Dead client detection via poll() timeout | Helper was blocking forever on dead connections |
 | NVIDIA opaque fds vs DMA-BUF fds | `cuImportExternalMemory` needs `nvFd`, not `drmFd` |
 
 ## Test results
 
-45 automated tests via `meson test`, plus manual Steam validation.
+46 automated tests via `meson test`, plus manual Steam validation.
 
 ### Automated C test suite (`meson test`)
 
@@ -101,7 +99,8 @@ The shared memory bridge went through several optimization rounds:
 | Shared memory (memfd) | ~6ms | Frame data in SHM, only 16-byte signal over socket |
 | SHM zero-copy redirect | ~5ms | `vaDeriveImage` maps directly to SHM, skip memcpy |
 | Eliminate redundant memset | ~4ms | Only zero 8 padding rows, not entire 3MB buffer |
-| Persistent CUDA buffer + cuMemcpy2D | **~3.5ms** | GPU DMA engine handles host→device + pitch in HW |
+| Persistent CUDA buffer + cuMemcpy2D | ~3ms | GPU DMA engine handles host→device + pitch in HW |
+| CUDA context kept active per session | **~2.8ms** | Eliminate per-frame cuCtxPushCurrent/PopCurrent |
 
 Final pipeline (1080p NV12):
 ```
@@ -115,13 +114,16 @@ Steam writes NV12 → SHM (zero-copy via vaDeriveImage)
 ## Code hardening
 
 All code reviewed for production reliability:
+- Zero warnings at `-Dwarning_level=3`, zero cppcheck issues
 - All CUDA/NVENC return values checked (no silent failures)
 - Socket frame_size capped at 64MB (prevents malloc bomb from corrupt data)
 - File descriptors tracked and closed (no fd leaks, verified with /proc/pid/fd)
-- Dead client detection via SO_RCVTIMEO (5s timeout)
+- Dead client detection via poll() with 5s timeout
 - Derived image buffer ownership tracked (sentinel prevents double-free)
 - DMA-BUF fds properly closed on partial import failure
 - NVIDIA opaque fds closed in surface destroy
+- Pre-allocated bitstream output buffer (no per-frame malloc)
+- CUDA context kept pushed for entire client session (no per-frame sync)
 
 ## What Steam actually uses
 
@@ -133,9 +135,9 @@ From streaming logs, Steam's ffmpeg VA-API encode pipeline uses:
 | Picture params (coded_buf, idr_pic_flag) | Yes | Working, IDR forwarded |
 | Rate control misc (bits_per_second, target_percentage) | Yes | Applied to NVENC RC |
 | Framerate misc | Yes | Applied |
-| HRD misc (buffer_size) | Yes (type 5) | Applied to NVENC vbvBufferSize |
+| HRD misc (buffer_size) | Yes | Applied to NVENC vbvBufferSize |
 | Packed headers (SEQ+PIC+SLICE+MISC) | Yes | Accepted (NVENC generates its own, no warning) |
-| Quality level | quality=0 (default) | VAConfigAttribEncQualityRange reported, not queried by Steam |
+| Quality level | quality=0 (default) | VAConfigAttribEncQualityRange reported |
 | vaDeriveImage + vaMapBuffer | Yes (every frame) | Implemented, zero-copy SHM redirect |
 | vaExportSurfaceHandle | No | Implemented but Steam doesn't call it |
 | vaPutImage | No | Implemented but Steam uses vaDeriveImage instead |
@@ -144,9 +146,9 @@ From streaming logs, Steam's ffmpeg VA-API encode pipeline uses:
 
 ### No B-frames
 
-`frameIntervalP=1` always. NVENC with B-frames returns `NV_ENC_ERR_NEED_MORE_INPUT` for reordered frames. ffmpeg 6.x `vaapi_encode` asserts on the resulting empty coded buffer. Verified by testing — enabling B-frames crashes ffmpeg.
+`frameIntervalP=1` always. NVENC with `enablePTD=1` and B-frames returns `NV_ENC_ERR_NEED_MORE_INPUT` for reordered frames, producing empty coded buffers. ffmpeg 6.x `vaapi_encode` asserts on empty coded buffers. With `enablePTD=0`, NVENC requires full DPB (Decoded Picture Buffer) reference frame management which Intel drivers handle in hardware but NVENC delegates to the caller.
 
-Not a problem: B-frames add latency, which is the opposite of what streaming needs. For offline transcoding, use `h264_nvenc`/`hevc_nvenc` directly.
+Not a problem for streaming (B-frames add latency). For offline transcoding with B-frames, use `h264_nvenc`/`hevc_nvenc` directly.
 
 ### Packed headers
 
@@ -154,21 +156,24 @@ Driver advertises full packed header support (SEQ+PIC+SLICE+MISC). NVENC generat
 
 ### 32-bit encode-only
 
-When the shared memory bridge is active (Blackwell 32-bit), only encoding works — no hardware decode. Steam only needs encode on the server side, so this is fine.
+When the shared memory bridge is active (CUDA unavailable), only encoding works — no hardware decode. Steam only needs encode on the server side, so this is fine.
+
+### HDR
+
+VA-API encode specification does not include color metadata fields (colour_primaries, transfer_characteristics) in sequence parameter structs. Intel drivers have the same limitation — HDR metadata only passes through packed headers (which NVENC generates internally). HDR encode requires direct NVENC (`hevc_nvenc` with `-color_primaries bt2020`).
 
 ## Files changed
 
-### New files (8)
-| File | Lines | Role |
-|------|-------|------|
-| `src/nvenc.c` | ~450 | NVENC wrapper: session, encoder, buffers |
-| `src/nvenc.h` | ~130 | NVENC context structures |
-| `src/h264_encode.c` | ~115 | H.264 VA-API parameter handlers |
-| `src/hevc_encode.c` | ~100 | HEVC VA-API parameter handlers |
-| `src/encode_handlers.h` | ~20 | Encode handler declarations |
-| `src/nvenc-helper.c` | ~870 | 64-bit encode daemon |
-| `src/nvenc-ipc-client.c` | ~360 | Shared memory bridge client |
-| `src/nvenc-ipc.h` | ~120 | Bridge protocol definitions |
+### New files (7)
+| File | Role |
+|------|------|
+| `src/nvenc.c` | NVENC wrapper: session, encoder, buffers |
+| `src/nvenc.h` | NVENC context structures + encode handler declarations |
+| `src/h264_encode.c` | H.264 VA-API parameter handlers |
+| `src/hevc_encode.c` | HEVC VA-API parameter handlers |
+| `src/nvenc-helper.c` | 64-bit encode daemon |
+| `src/nvenc-ipc-client.c` | Shared memory bridge client |
+| `src/nvenc-ipc.h` | Bridge protocol definitions |
 
 ### Modified files (4)
 | File | Role |
@@ -176,24 +181,24 @@ When the shared memory bridge is active (Blackwell 32-bit), only encoding works 
 | `src/vabackend.c` | Encode paths in all VA-API callbacks |
 | `src/vabackend.h` | Encode fields in driver structures |
 | `src/direct/direct-export-buf.c` | CUDA-optional surface allocation |
-| `meson.build` | New sources + helper binary |
+| `meson.build` | New sources + helper binary + test targets |
 
-### Test files (4)
+### Test files (3)
 | File | Role |
 |------|------|
 | `tests/test_encode.c` | 11 encode cycle integration tests |
-| `tests/test_encode_config.c` | 34 config/capability/surface tests |
-| `tests/test_common.h` | Shared test framework (macros, timer, setup) |
-| `tests/encoding-tests.md` | Manual test documentation + edge cases |
+| `tests/test_encode_config.c` | 35 config/capability/surface tests |
+| `tests/test_common.h` | Shared test framework |
 
-### Supporting files (4)
+### Supporting files
 | File | Role |
 |------|------|
 | `cross-i386.txt` | Meson cross-compilation for 32-bit |
-| `install.sh` | Build + install both archs + systemd |
+| `install.sh` | Auto-detects driver version, installs all deps + builds + systemd |
 | `nvenc-helper.service` | Systemd user service |
 | `docs/nvenc-encoding.md` | Full architecture documentation |
 | `docs/pr-summary.md` | This document |
+| `tests/encoding-tests.md` | Manual test documentation + edge cases |
 
 ## Comparison with PR #425
 
@@ -203,29 +208,21 @@ PR #425 by alper-han also adds NVENC encoding. Key differences:
 |-|---------|---------|
 | Codecs | H.264 only | H.264 + HEVC + Main10 |
 | 32-bit Steam | Not addressed | Full shared memory bridge |
-| B-frames | Supported | Disabled (ffmpeg compat) |
-| Packed headers | Full support | Accepted, NVENC-generated |
-| File count | 27 files changed | 12 new + 4 modified |
+| B-frames | Attempted (requires DPB mgmt) | Disabled (ffmpeg 6.x compat) |
+| Packed headers | Injection support | Accepted, NVENC-generated |
+| File count | 27 files changed | 7 new + 4 modified |
 | Steam tested | Not mentioned | Verified on Mac + Legion Go |
 
-The approaches are complementary. PR #425 has a cleaner encode abstraction layer and packed header support. This PR has the 32-bit bridge and HEVC. Both solve the core problem of making `VAEntrypointEncSlice` available on NVIDIA.
+The approaches are complementary. PR #425 has a cleaner encode abstraction layer. This PR has the 32-bit bridge and HEVC. Both solve the core problem of making `VAEntrypointEncSlice` available on NVIDIA.
 
 ## How to test
 
 ```bash
-# Install
+git clone https://github.com/efortin/nvidia-vaapi-driver
+cd nvidia-vaapi-driver && git checkout feat/nvenc-support
 ./install.sh
-
-# Verify
-vainfo --display drm --device /dev/dri/renderD128
-
-# Encode
-ffmpeg -vaapi_device /dev/dri/renderD128 \
-  -f lavfi -i testsrc=duration=5:size=1920x1080:rate=30 \
-  -vf 'format=nv12,hwupload' -c:v h264_vaapi -qp 20 test.mp4
-
-# Steam Remote Play: just launch Steam, no env vars needed
-steam
+sudo reboot
+# Then just launch Steam — no env vars needed
 ```
 
 ## Hardware tested
